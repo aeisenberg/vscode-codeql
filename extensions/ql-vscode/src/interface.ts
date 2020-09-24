@@ -32,6 +32,7 @@ import {
   RawResultsSortState,
 } from './interface-types';
 import { Logger } from './logging';
+import { commandRunner } from './helpers';
 import * as messages from './messages';
 import { CompletedQuery, interpretResults } from './query-results';
 import { QueryInfo, tmpDir } from './run-queries';
@@ -121,20 +122,20 @@ export class InterfaceManager extends DisposableObject {
     );
     logger.log('Registering path-step navigation commands.');
     this.push(
-      vscode.commands.registerCommand(
+      commandRunner(
         'codeQLQueryResults.nextPathStep',
         this.navigatePathStep.bind(this, 1)
       )
     );
     this.push(
-      vscode.commands.registerCommand(
+      commandRunner(
         'codeQLQueryResults.previousPathStep',
         this.navigatePathStep.bind(this, -1)
       )
     );
   }
 
-  navigatePathStep(direction: number): void {
+  async navigatePathStep(direction: number): Promise<void> {
     this.postMessage({ t: 'navigatePath', direction });
   }
 
