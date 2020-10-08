@@ -9,7 +9,8 @@ import {
   window as Window,
   workspace,
   commands,
-  Disposable
+  Disposable,
+  ProgressLocation
 } from 'vscode';
 import { CodeQLCliServer } from './cli';
 import { logger } from './logging';
@@ -97,22 +98,15 @@ export function withProgress<R>(
  * If there is no progress monitor, then only extra command arguments are passed in.
  *
  * @param commandId The ID of the command to register.
- * @param task The task to run. If passing taskOptions, then this task must be a `ProgressTask`.
- * @param progressOptions Optional argument. If present, then the task is run with a progress monitor
- *                    and cancellation token, otherwise it is run with no arguments.
+ * @param task The task to run. If passing `progressOptions`, then this task must be a `ProgressTask`.
  */
-export function commandRunner<R>(
+export function commandRunner(
   commandId: string,
-  task: ProgressTask<R> | NoProgressTask,
-  progressOptions?: ProgressOptions
+  task: NoProgressTask,
 ): Disposable {
   return commands.registerCommand(commandId, async (...args: any[]) => {
     try {
-      if (progressOptions) {
-        await withProgress(progressOptions, task as ProgressTask<R>, ...args);
-      } else {
-        await (task as ((...args: any[]) => Promise<any>))(...args);
-      }
+      await task(...args);
     } catch (e) {
       if (e instanceof UserCancellationException) {
         // User has cancelled this action manually
@@ -121,10 +115,53 @@ export function commandRunner<R>(
         } else {
           showAndLogWarningMessage(e.message);
         }
-      } else if (e instanceof Error) {
-        showAndLogErrorMessage(e.message);
       } else {
-        throw e;
+        showAndLogErrorMessage(e.message || e);
+      }
+    }
+  });
+}
+
+/**
+ * A generic wrapper for commands. This wrapper adds error handling and progress monitoring
+ * for any command. This variant runs with a progress monitor.
+ *
+ * There are two ways to invoke the command task: with or without a progress monitor
+ * If progressOptions are passed in, then the command task will run with a progress monitor
+ * Otherwise, no progress monitor will be used.
+ *
+ * The first two arguments to the task are always
+ * the progress callback, and the cancellation token. And this is followed by any extra command arguments
+ * (eg- selection, multiselection, ...).
+ *
+ * If there is no progress monitor, then only extra command arguments are passed in.
+ *
+ * @param commandId The ID of the command to register.
+ * @param task The task to run. If passing `progressOptions`, then this task must be a `ProgressTask`.
+ * @param progressOptions Progress options to be sent to a progress monitor
+ */
+export function commandRunnerWithProgress<R>(
+  commandId: string,
+  task: ProgressTask<R>,
+  progressOptions: Partial<ProgressOptions>
+): Disposable {
+  return commands.registerCommand(commandId, async (...args: any[]) => {
+    const progressOptionsWithDefaults = {
+      location: ProgressLocation.Notification,
+      ...progressOptions
+    };
+    try {
+      await withProgress(progressOptionsWithDefaults, task, ...args);
+    } catch (e) {
+      if (e instanceof UserCancellationException) {
+        // User has cancelled this action manually
+        if (e.silent) {
+          logger.log(e.message);
+        } else {
+          showAndLogWarningMessage(e.message);
+        }
+      } else {
+        showAndLogErrorMessage(e.message || e);
       }
     }
   });
