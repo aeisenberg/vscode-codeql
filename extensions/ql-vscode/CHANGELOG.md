@@ -2,6 +2,8 @@
 
 ## [UNRELEASED]
 
+## [UNRELEASED]
+
 ## 1.3.4 - 22 October 2020
 
 - Add friendly welcome message when the databases view is empty.
