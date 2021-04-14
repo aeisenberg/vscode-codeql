@@ -137,9 +137,11 @@ export class InterfaceManager extends DisposableObject {
       this.databaseManager.onDidChangeDatabaseItem(({ kind }) => {
         if (kind === DatabaseEventKind.Remove) {
           this._diagnosticCollection.clear();
-          this.postMessage({
-            t: 'untoggleShowProblems'
-          });
+          if (this.isShowingPanel()) {
+            this.postMessage({
+              t: 'untoggleShowProblems'
+            });
+          }
         }
       })
     );
@@ -147,6 +149,10 @@ export class InterfaceManager extends DisposableObject {
 
   async navigatePathStep(direction: number): Promise<void> {
     this.postMessage({ t: 'navigatePath', direction });
+  }
+
+  private isShowingPanel() {
+    return !!this._panel;
   }
 
   // Returns the webview panel, creating it if it doesn't already
