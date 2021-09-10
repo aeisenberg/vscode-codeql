@@ -6,26 +6,31 @@ import * as chai from 'chai';
 import { window } from 'vscode';
 import * as pq from 'proxyquire';
 
-import { getRepositories } from '../../run-remote-query';
 const proxyquire = pq.noPreserveCache();
 chai.use(chaiAsPromised);
 const expect = chai.expect;
 
-describe('run-remote-query', function() {
+describe.only('run-remote-query', function() {
 
   describe('getRepositories', () => {
     let sandbox: sinon.SinonSandbox;
     let quickPickSpy: sinon.SinonStub;
     let showInputBoxSpy: sinon.SinonStub;
     let getRemoteRepositoryListsSpy: sinon.SinonStub;
+    let mod: any;
+    let mockRequest: sinon.SinonStub;
     beforeEach(() => {
       sandbox = sinon.createSandbox();
       quickPickSpy = sandbox.stub(window, 'showQuickPick');
       showInputBoxSpy = sandbox.stub(window, 'showInputBox');
       getRemoteRepositoryListsSpy = sandbox.stub();
-      proxyquire('../../run-remote-query', {
+
+      mod = proxyquire('../../run-remote-query', {
         './config': {
-          getRemoteRepositoryLists: getRemoteRepositoryListsSpy
+          getRemoteRepositoryLists: getRemoteRepositoryListsSpy.
+        },
+        './helpers': {
+          showAndLogErrorMessage: ... //
         }
       });
     });
@@ -39,7 +44,7 @@ describe('run-remote-query', function() {
       quickPickSpy.resolves(
         { repoList: ['foo/bar', 'foo/baz'] }
       );
-      getRemoteRepositoryListsSpy.resolves(
+      getRemoteRepositoryListsSpy.returns(
         {
           'list1': ['foo/bar', 'foo/baz'],
           'list2': [],
@@ -47,10 +52,10 @@ describe('run-remote-query', function() {
       );
 
       // make the function call
-      const repoList = await getRepositories();
+      const repoList = await mod.getRepositories();
 
       // Check that the return value is correct
-      expect(repoList).to.equal(
+      expect(repoList).to.deep.eq(
         ['foo/bar', 'foo/baz']
       );
     });
@@ -58,16 +63,25 @@ describe('run-remote-query', function() {
     it('should show a textbox if you have no repo lists configured', async () => {
       // fake return values
       showInputBoxSpy.resolves('foo/bar');
-      getRemoteRepositoryListsSpy.resolves({});
+      getRemoteRepositoryListsSpy.returns({});
 
       // make the function call
-      const repoList = await getRepositories();
+      const repoList = await mod.getRepositories();
 
       // Check that the return value is correct
-      expect(repoList).to.equal(
+      expect(repoList).to.deep.equal(
         ['foo/bar']
       );
     });
+
+    function getMockCredentials(response: any) {
+      mockRequest = sinon.stub().resolves(response);
+      return {
+        getOctokit: () => ({
+          request: mockRequest
+        })
+      };
+    }
   });
 
   describe('runRemoteQuery', () => {

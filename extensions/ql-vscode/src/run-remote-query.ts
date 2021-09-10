@@ -110,7 +110,7 @@ export async function runRemoteQuery(cliServer: cli.CodeQLCliServer, credentials
   await runRemoteQueriesApiRequest(credentials, ref, language, repositories, query);
 }
 
-async function runRemoteQueriesApiRequest(credentials: Credentials, ref: string, language: string, repositories: string[], query: string) {
+export async function runRemoteQueriesApiRequest(credentials: Credentials, ref: string, language: string, repositories: string[], query: string) {
   const octokit = await credentials.getOctokit();
 
   try {
