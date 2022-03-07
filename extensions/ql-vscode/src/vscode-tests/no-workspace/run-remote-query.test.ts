@@ -25,11 +25,11 @@ describe('run-remote-query', function() {
       showInputBoxSpy = sandbox.stub(window, 'showInputBox');
       getRemoteRepositoryListsSpy = sandbox.stub();
       showAndLogErrorMessageSpy = sandbox.stub();
-      mod = proxyquire('../../run-remote-query', {
-        './config': {
+      mod = proxyquire('../../remote-queries/run-remote-query', {
+        '../config': {
           getRemoteRepositoryLists: getRemoteRepositoryListsSpy
         },
-        './helpers': {
+        '../helpers': {
           showAndLogErrorMessage: showAndLogErrorMessageSpy
         },
       });
@@ -114,11 +114,10 @@ describe('run-remote-query', function() {
     let mod: any;
 
     const error = {
-      message: 'Unable to run query on the specified repositories. Some repositories were invalid or don\'t have database uploads enabled.',
+      message: 'Unable to run query on the specified repositories. Some repositories were invalid.',
       response: {
         data: {
-          invalid_repos: ['abc/def', 'ghi/jkl'],
-          repos_without_db_uploads: ['mno/pqr', 'stu/vwx']
+          invalid_repos: ['abc/def', 'ghi/jkl']
         }
       }
     };
@@ -134,12 +133,12 @@ describe('run-remote-query', function() {
       logSpy = sandbox.stub();
       showAndLogErrorMessageSpy = sandbox.stub();
       showInformationMessageWithActionSpy = sandbox.stub();
-      mod = proxyquire('../../run-remote-query', {
-        './helpers': {
+      mod = proxyquire('../../remote-queries/run-remote-query', {
+        '../helpers': {
           showAndLogErrorMessage: showAndLogErrorMessageSpy,
           showInformationMessageWithAction: showInformationMessageWithActionSpy
         },
-        './logging': {
+        '../logging': {
           'logger': {
             log: logSpy
           }
@@ -151,7 +150,7 @@ describe('run-remote-query', function() {
     });
 
     it('should return and log error if it can\'t run on any repos', async () => {
-      const repositories = ['abc/def', 'ghi/jkl', 'mno/pqr', 'stu/vwx'];
+      const repositories = ['abc/def', 'ghi/jkl'];
 
       // make the function call
       await mod.attemptRerun(error, credentials, ref, language, repositories, query, owner, repo);
@@ -159,12 +158,11 @@ describe('run-remote-query', function() {
       // check logging output
       expect(logSpy.firstCall.args[0]).to.contain('Unable to run query');
       expect(logSpy.secondCall.args[0]).to.contain('Invalid repos: abc/def, ghi/jkl');
-      expect(logSpy.thirdCall.args[0]).to.contain('Repos without DB uploads: mno/pqr, stu/vwx');
       expect(showAndLogErrorMessageSpy.firstCall.args[0]).to.contain('Unable to run query on any');
     });
 
-    it('should list invalid repos and repos without DB uploads, and rerun on valid ones', async () => {
-      const repositories = ['foo/bar', 'abc/def', 'ghi/jkl', 'mno/pqr', 'foo/baz'];
+    it('should list invalid repos and rerun on valid ones', async () => {
+      const repositories = ['foo/bar', 'abc/def', 'ghi/jkl', 'foo/baz'];
 
       // fake return values
       showInformationMessageWithActionSpy.resolves(true);
@@ -175,7 +173,6 @@ describe('run-remote-query', function() {
       // check logging output
       expect(logSpy.firstCall.args[0]).to.contain('Unable to run query');
       expect(logSpy.secondCall.args[0]).to.contain('Invalid repos: abc/def, ghi/jkl');
-      expect(logSpy.thirdCall.args[0]).to.contain('Repos without DB uploads: mno/pqr');
 
       // check that the correct information message is displayed
       expect(showInformationMessageWithActionSpy.firstCall.args[0]).to.contain('Unable to run query on some');
@@ -197,9 +194,5 @@ describe('run-remote-query', function() {
         })
       };
     }
-  });
-
-  describe('runRemoteQuery', () => {
-    // TODO
   });
 });

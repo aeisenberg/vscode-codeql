@@ -2,6 +2,7 @@ import * as fs from 'fs-extra';
 import * as glob from 'glob-promise';
 import * as yaml from 'js-yaml';
 import * as path from 'path';
+import * as tmp from 'tmp-promise';
 import {
   ExtensionContext,
   Uri,
@@ -12,6 +13,18 @@ import {
 import { CodeQLCliServer, QlpacksInfo } from './cli';
 import { UserCancellationException } from './commandRunner';
 import { logger } from './logging';
+import { QueryMetadata } from './pure/interface-types';
+
+// Shared temporary folder for the extension.
+export const tmpDir = tmp.dirSync({ prefix: 'queries_', keep: false, unsafeCleanup: true });
+export const upgradesTmpDir = path.join(tmpDir.name, 'upgrades');
+fs.ensureDirSync(upgradesTmpDir);
+
+export const tmpDirDisposal = {
+  dispose: () => {
+    tmpDir.removeCallback();
+  }
+};
 
 /**
  * Show an error message and log it to the console
@@ -515,4 +528,55 @@ export async function askForLanguage(cliServer: CodeQLCliServer, throwOnEmpty = 
     }
   }
   return language;
+}
+
+/**
+ * Gets metadata for a query, if it exists.
+ * @param cliServer The CLI server.
+ * @param queryPath The path to the query.
+ * @returns A promise that resolves to the query metadata, if available.
+ */
+export async function tryGetQueryMetadata(cliServer: CodeQLCliServer, queryPath: string): Promise<QueryMetadata | undefined> {
+  try {
+    return await cliServer.resolveMetadata(queryPath);
+  } catch (e) {
+    // Ignore errors and provide no metadata.
+    void logger.log(`Couldn't resolve metadata for ${queryPath}: ${e}`);
+    return;
+  }
+}
+
+/**
+ * Creates a file in the query directory that indicates when this query was created.
+ * This is important for keeping track of when queries should be removed.
+ *
+ * @param queryPath The directory that will containt all files relevant to a query result.
+ * It does not need to exist.
+ */
+export async function createTimestampFile(storagePath: string) {
+  const timestampPath = path.join(storagePath, 'timestamp');
+  await fs.ensureDir(storagePath);
+  await fs.writeFile(timestampPath, Date.now().toString(), 'utf8');
+}
+
+
+/**
+ * Recursively walk a directory and return the full path to all files found.
+ * Symbolic links are ignored.
+ *
+ * @param dir the directory to walk
+ *
+ * @return An iterator of the full path to all files recursively found in the directory.
+ */
+export async function* walkDirectory(dir: string): AsyncIterableIterator<string> {
+  const seenFiles = new Set<string>();
+  for await (const d of await fs.opendir(dir)) {
+    const entry = path.join(dir, d.name);
+    seenFiles.add(entry);
+    if (d.isDirectory()) {
+      yield* walkDirectory(entry);
+    } else if (d.isFile()) {
+      yield entry;
+    }
+  }
 }

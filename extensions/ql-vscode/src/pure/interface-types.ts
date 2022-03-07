@@ -1,5 +1,6 @@
 import * as sarif from 'sarif';
-import { RemoteQueryResult } from '../remote-queries/shared/remote-query-result';
+import { AnalysisResults } from '../remote-queries/shared/analysis-result';
+import { AnalysisSummary, RemoteQueryResult } from '../remote-queries/shared/remote-query-result';
 import { RawResultSet, ResultRow, ResultSetSchema, Column, ResolvableLocationValue } from './bqrs-cli-types';
 
 /**
@@ -9,15 +10,17 @@ import { RawResultSet, ResultRow, ResultSetSchema, Column, ResolvableLocationVal
 
 export const SELECT_TABLE_NAME = '#select';
 export const ALERTS_TABLE_NAME = 'alerts';
+export const GRAPH_TABLE_NAME = 'graph';
 
 export type RawTableResultSet = { t: 'RawResultSet' } & RawResultSet;
-export type PathTableResultSet = {
-  t: 'SarifResultSet';
+export type InterpretedResultSet<T> = {
+  t: 'InterpretedResultSet';
   readonly schema: ResultSetSchema;
   name: string;
-} & Interpretation;
+  interpretation: InterpretationT<T>;
+};
 
-export type ResultSet = RawTableResultSet | PathTableResultSet;
+export type ResultSet = RawTableResultSet | InterpretedResultSet<InterpretationData>;
 
 /**
  * Only ever show this many rows in a raw result table.
@@ -45,17 +48,30 @@ export interface PreviousExecution {
   durationSeconds: number;
 }
 
-export interface Interpretation {
-  sourceLocationPrefix: string;
-  numTruncatedResults: number;
-  numTotalResults: number;
+export type SarifInterpretationData = {
+  t: 'SarifInterpretationData';
   /**
    * sortState being undefined means don't sort, just present results in the order
    * they appear in the sarif file.
    */
   sortState?: InterpretedResultsSortState;
-  sarif: sarif.Log;
+} & sarif.Log;
+
+export type GraphInterpretationData = {
+  t: 'GraphInterpretationData';
+  dot: string[];
+};
+
+export type InterpretationData = SarifInterpretationData | GraphInterpretationData;
+
+export interface InterpretationT<T> {
+  sourceLocationPrefix: string;
+  numTruncatedResults: number;
+  numTotalResults: number;
+  data: T;
 }
+
+export type Interpretation = InterpretationT<InterpretationData>;
 
 export interface ResultsPaths {
   resultsPath: string;
@@ -179,6 +195,11 @@ export interface OpenFileMsg {
   t: 'openFile';
   /* Full path to the file to open. */
   filePath: string;
+}
+
+export interface OpenVirtualFileMsg {
+  t: 'openVirtualFile';
+  queryText: string;
 }
 
 /**
@@ -310,7 +331,7 @@ export interface SetComparisonsMessage {
   readonly currentResultSetName: string;
   readonly rows: QueryCompareResult | undefined;
   readonly message: string | undefined;
-  readonly datebaseUri: string;
+  readonly databaseUri: string;
 }
 
 export enum DiffKind {
@@ -351,8 +372,9 @@ export function getDefaultResultSetName(
   // Choose first available result set from the array
   return [
     ALERTS_TABLE_NAME,
+    GRAPH_TABLE_NAME,
     SELECT_TABLE_NAME,
-    resultSetNames[0],
+    resultSetNames[0]
   ].filter((resultSetName) => resultSetNames.includes(resultSetName))[0];
 }
 
@@ -368,10 +390,16 @@ export interface ParsedResultSets {
 
 export type FromRemoteQueriesMessage =
   | RemoteQueryLoadedMessage
-  | RemoteQueryErrorMessage;
+  | RemoteQueryErrorMessage
+  | OpenFileMsg
+  | OpenVirtualFileMsg
+  | RemoteQueryDownloadAnalysisResultsMessage
+  | RemoteQueryDownloadAllAnalysesResultsMessage
+  | RemoteQueryViewAnalysisResultsMessage;
 
 export type ToRemoteQueriesMessage =
-  | SetRemoteQueryResultMessage;
+  | SetRemoteQueryResultMessage
+  | SetAnalysesResultsMessage;
 
 export interface RemoteQueryLoadedMessage {
   t: 'remoteQueryLoaded';
@@ -382,7 +410,27 @@ export interface SetRemoteQueryResultMessage {
   queryResult: RemoteQueryResult
 }
 
+export interface SetAnalysesResultsMessage {
+  t: 'setAnalysesResults';
+  analysesResults: AnalysisResults[];
+}
+
 export interface RemoteQueryErrorMessage {
   t: 'remoteQueryError';
   error: string;
+}
+
+export interface RemoteQueryDownloadAnalysisResultsMessage {
+  t: 'remoteQueryDownloadAnalysisResults';
+  analysisSummary: AnalysisSummary
+}
+
+export interface RemoteQueryDownloadAllAnalysesResultsMessage {
+  t: 'remoteQueryDownloadAllAnalysesResults';
+  analysisSummaries: AnalysisSummary[];
+}
+
+export interface RemoteQueryViewAnalysisResultsMessage {
+  t: 'remoteQueryViewAnalysisResults';
+  analysisSummary: AnalysisSummary
 }

@@ -10,6 +10,7 @@ import {
   TextDocument,
   Uri
 } from 'vscode';
+import * as path from 'path';
 
 import { decodeSourceArchiveUri, encodeArchiveBasePath, zipArchiveScheme } from '../archive-filesystem-provider';
 import { CodeQLCliServer } from '../cli';
@@ -18,7 +19,7 @@ import { CachedOperation } from '../helpers';
 import { ProgressCallback, withProgress } from '../commandRunner';
 import * as messages from '../pure/messages';
 import { QueryServerClient } from '../queryserver-client';
-import { compileAndRunQueryAgainstDatabase, QueryWithResults } from '../run-queries';
+import { compileAndRunQueryAgainstDatabase, createInitialQueryInfo, QueryWithResults } from '../run-queries';
 import AstBuilder from './astBuilder';
 import {
   KeyType,
@@ -41,6 +42,7 @@ export class TemplateQueryDefinitionProvider implements DefinitionProvider {
     private cli: CodeQLCliServer,
     private qs: QueryServerClient,
     private dbm: DatabaseManager,
+    private queryStorageDir: string,
   ) {
     this.cache = new CachedOperation<LocationLink[]>(this.getDefinitions.bind(this));
   }
@@ -68,6 +70,7 @@ export class TemplateQueryDefinitionProvider implements DefinitionProvider {
         this.dbm,
         uriString,
         KeyType.DefinitionQuery,
+        this.queryStorageDir,
         progress,
         token,
         (src, _dest) => src === uriString
@@ -83,6 +86,7 @@ export class TemplateQueryReferenceProvider implements ReferenceProvider {
     private cli: CodeQLCliServer,
     private qs: QueryServerClient,
     private dbm: DatabaseManager,
+    private queryStorageDir: string,
   ) {
     this.cache = new CachedOperation<FullLocationLink[]>(this.getReferences.bind(this));
   }
@@ -115,6 +119,7 @@ export class TemplateQueryReferenceProvider implements ReferenceProvider {
         this.dbm,
         uriString,
         KeyType.DefinitionQuery,
+        this.queryStorageDir,
         progress,
         token,
         (src, _dest) => src === uriString
@@ -123,33 +128,39 @@ export class TemplateQueryReferenceProvider implements ReferenceProvider {
   }
 }
 
+type QueryWithDb = {
+  query: QueryWithResults,
+  dbUri: Uri
+};
+
 export class TemplatePrintAstProvider {
-  private cache: CachedOperation<QueryWithResults>;
+  private cache: CachedOperation<QueryWithDb>;
 
   constructor(
     private cli: CodeQLCliServer,
     private qs: QueryServerClient,
     private dbm: DatabaseManager,
+    private queryStorageDir: string,
   ) {
-    this.cache = new CachedOperation<QueryWithResults>(this.getAst.bind(this));
+    this.cache = new CachedOperation<QueryWithDb>(this.getAst.bind(this));
   }
 
   async provideAst(
     progress: ProgressCallback,
     token: CancellationToken,
-    document?: TextDocument
+    fileUri?: Uri
   ): Promise<AstBuilder | undefined> {
-    if (!document) {
+    if (!fileUri) {
       throw new Error('Cannot view the AST. Please select a valid source file inside a CodeQL database.');
     }
-    const queryResults = this.shouldCache()
-      ? await this.cache.get(document.uri.toString(), progress, token)
-      : await this.getAst(document.uri.toString(), progress, token);
+    const { query, dbUri } = this.shouldCache()
+      ? await this.cache.get(fileUri.toString(), progress, token)
+      : await this.getAst(fileUri.toString(), progress, token);
 
     return new AstBuilder(
-      queryResults, this.cli,
-      this.dbm.findDatabaseItem(Uri.parse(queryResults.database.databaseUri!, true))!,
-      document.fileName
+      query, this.cli,
+      this.dbm.findDatabaseItem(dbUri)!,
+      path.basename(fileUri.fsPath),
     );
   }
 
@@ -161,7 +172,7 @@ export class TemplatePrintAstProvider {
     uriString: string,
     progress: ProgressCallback,
     token: CancellationToken
-  ): Promise<QueryWithResults> {
+  ): Promise<QueryWithDb> {
     const uri = Uri.parse(uriString, true);
     if (uri.scheme !== zipArchiveScheme) {
       throw new Error('Cannot view the AST. Please select a valid source file inside a CodeQL database.');
@@ -195,15 +206,86 @@ export class TemplatePrintAstProvider {
       }
     };
 
-    return await compileAndRunQueryAgainstDatabase(
-      this.cli,
-      this.qs,
-      db,
-      false,
+    const initialInfo = await createInitialQueryInfo(
       Uri.file(query),
-      progress,
-      token,
-      templates
+      {
+        name: db.name,
+        databaseUri: db.databaseUri.toString(),
+      },
+      false
     );
+
+    return {
+      query: await compileAndRunQueryAgainstDatabase(
+        this.cli,
+        this.qs,
+        db,
+        initialInfo,
+        this.queryStorageDir,
+        progress,
+        token,
+        templates
+      ),
+      dbUri: db.databaseUri
+    };
+  }
+}
+
+export class TemplatePrintCfgProvider {
+  private cache: CachedOperation<[Uri, messages.TemplateDefinitions] | undefined>;
+
+  constructor(
+    private cli: CodeQLCliServer,
+    private dbm: DatabaseManager,
+  ) {
+    this.cache = new CachedOperation<[Uri, messages.TemplateDefinitions] | undefined>(this.getCfgUri.bind(this));
+  }
+
+  async provideCfgUri(document?: TextDocument): Promise<[Uri, messages.TemplateDefinitions] | undefined> {
+    if (!document) {
+      return;
+    }
+    return await this.cache.get(document.uri.toString());
+  }
+
+  private async getCfgUri(uriString: string): Promise<[Uri, messages.TemplateDefinitions]> {
+    const uri = Uri.parse(uriString, true);
+    if (uri.scheme !== zipArchiveScheme) {
+      throw new Error('CFG Viewing is only available for databases with zipped source archives.');
+    }
+
+    const zippedArchive = decodeSourceArchiveUri(uri);
+    const sourceArchiveUri = encodeArchiveBasePath(zippedArchive.sourceArchiveZipPath);
+    const db = this.dbm.findDatabaseItemBySourceArchive(sourceArchiveUri);
+
+    if (!db) {
+      throw new Error('Can\'t infer database from the provided source.');
+    }
+
+    const qlpack = await qlpackOfDatabase(this.cli, db);
+    if (!qlpack) {
+      throw new Error('Can\'t infer qlpack from database source archive.');
+    }
+    const queries = await resolveQueries(this.cli, qlpack, KeyType.PrintCfgQuery);
+    if (queries.length > 1) {
+      throw new Error(`Found multiple Print CFG queries. Can't continue. Make sure there is exacly one query with the tag ${KeyType.PrintCfgQuery}`);
+    }
+    if (queries.length === 0) {
+      throw new Error(`Did not find any Print CFG queries. Can't continue. Make sure there is exacly one query with the tag ${KeyType.PrintCfgQuery}`);
+    }
+
+    const queryUri = Uri.file(queries[0]);
+
+    const templates: messages.TemplateDefinitions = {
+      [TEMPLATE_NAME]: {
+        values: {
+          tuples: [[{
+            stringValue: zippedArchive.pathWithinSourceArchive
+          }]]
+        }
+      }
+    };
+
+    return [queryUri, templates];
   }
 }

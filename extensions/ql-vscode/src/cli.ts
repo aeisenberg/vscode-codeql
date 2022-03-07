@@ -1,5 +1,6 @@
 import * as cpp from 'child-process-promise';
 import * as child_process from 'child_process';
+import * as fs from 'fs-extra';
 import * as path from 'path';
 import * as sarif from 'sarif';
 import { SemVer } from 'semver';
@@ -17,7 +18,7 @@ import { QueryMetadata, SortDirection } from './pure/interface-types';
 import { Logger, ProgressReporter } from './logging';
 import { CompilationMessage } from './pure/messages';
 import { sarifParser } from './sarif-parser';
-import { dbSchemeToLanguage } from './helpers';
+import { dbSchemeToLanguage, walkDirectory } from './helpers';
 
 /**
  * The version of the SARIF format that we are using.
@@ -403,7 +404,7 @@ export class CodeQLCliServer implements Disposable {
     try {
       if (cancellationToken !== undefined) {
         cancellationRegistration = cancellationToken.onCancellationRequested(_e => {
-          tk(child.pid);
+          tk(child.pid || 0);
         });
       }
       if (logger !== undefined) {
@@ -514,8 +515,7 @@ export class CodeQLCliServer implements Disposable {
   async resolveLibraryPath(workspaces: string[], queryPath: string): Promise<QuerySetup> {
     const subcommandArgs = [
       '--query', queryPath,
-      '--additional-packs',
-      workspaces.join(path.delimiter)
+      ...this.getAdditionalPacksArg(workspaces)
     ];
     return await this.runJsonCodeQlCliCommand<QuerySetup>(['resolve', 'library-path'], subcommandArgs, 'Resolving library paths');
   }
@@ -528,8 +528,7 @@ export class CodeQLCliServer implements Disposable {
     const subcommandArgs = [
       '--format', 'bylanguage',
       queryUri.fsPath,
-      '--additional-packs',
-      workspaces.join(path.delimiter)
+      ...this.getAdditionalPacksArg(workspaces)
     ];
     return JSON.parse(await this.runCodeQlCliCommand(['resolve', 'queries'], subcommandArgs, 'Resolving query by language'));
   }
@@ -563,6 +562,17 @@ export class CodeQLCliServer implements Disposable {
   }
 
   /**
+   * Issues an internal clear-cache command to the cli server. This
+   * command is used to clear the qlpack cache of the server.
+   *
+   * This cache is generally cleared every 1s. This method is used
+   * to force an early clearing of the cache.
+   */
+  public async clearCache(): Promise<void> {
+    await this.runCodeQlCliCommand(['clear-cache'], [], 'Clearing qlpack cache');
+  }
+
+  /**
    * Runs QL tests.
    * @param testPaths Full paths of the tests to run.
    * @param workspaces Workspace paths to use as search paths for QL packs.
@@ -573,7 +583,7 @@ export class CodeQLCliServer implements Disposable {
   ): AsyncGenerator<TestCompleted, void, unknown> {
 
     const subcommandArgs = this.cliConfig.additionalTestArguments.concat([
-      '--additional-packs', workspaces.join(path.delimiter),
+      ...this.getAdditionalPacksArg(workspaces),
       '--threads',
       this.cliConfig.numberTestThreads.toString(),
       ...testPaths
@@ -595,8 +605,12 @@ export class CodeQLCliServer implements Disposable {
 
   /** Resolves the ML models that should be available when evaluating a query. */
   async resolveMlModels(additionalPacks: string[]): Promise<MlModelsInfo> {
-    return await this.runJsonCodeQlCliCommand<MlModelsInfo>(['resolve', 'ml-models'], ['--additional-packs',
-      additionalPacks.join(path.delimiter)], 'Resolving ML models', false);
+    return await this.runJsonCodeQlCliCommand<MlModelsInfo>(
+      ['resolve', 'ml-models'],
+      this.getAdditionalPacksArg(additionalPacks),
+      'Resolving ML models',
+      false
+    );
   }
 
   /**
@@ -674,20 +688,13 @@ export class CodeQLCliServer implements Disposable {
     return await this.runJsonCodeQlCliCommand<DecodedBqrsChunk>(['bqrs', 'decode'], subcommandArgs, 'Reading bqrs data');
   }
 
-  async runInterpretCommand(format: string, metadata: QueryMetadata, resultsPath: string, interpretedResultsPath: string, sourceInfo?: SourceInfo) {
+  async runInterpretCommand(format: string, additonalArgs: string[], metadata: QueryMetadata, resultsPath: string, interpretedResultsPath: string, sourceInfo?: SourceInfo) {
     const args = [
       '--output', interpretedResultsPath,
       '--format', format,
       // Forward all of the query metadata.
       ...Object.entries(metadata).map(([key, value]) => `-t=${key}=${value}`)
-    ];
-    if (format == SARIF_FORMAT) {
-      // TODO: This flag means that we don't group interpreted results
-      // by primary location. We may want to revisit whether we call
-      // interpretation with and without this flag, or do some
-      // grouping client-side.
-      args.push('--no-group-results');
-    }
+    ].concat(additonalArgs);
     if (sourceInfo !== undefined) {
       args.push(
         '--source-archive', sourceInfo.sourceArchive,
@@ -709,13 +716,47 @@ export class CodeQLCliServer implements Disposable {
     await this.runCodeQlCliCommand(['bqrs', 'interpret'], args, 'Interpreting query results');
   }
 
-  async interpretBqrs(metadata: QueryMetadata, resultsPath: string, interpretedResultsPath: string, sourceInfo?: SourceInfo): Promise<sarif.Log> {
-    await this.runInterpretCommand(SARIF_FORMAT, metadata, resultsPath, interpretedResultsPath, sourceInfo);
+  async interpretBqrsSarif(metadata: QueryMetadata, resultsPath: string, interpretedResultsPath: string, sourceInfo?: SourceInfo): Promise<sarif.Log> {
+    const additionalArgs = [
+      // TODO: This flag means that we don't group interpreted results
+      // by primary location. We may want to revisit whether we call
+      // interpretation with and without this flag, or do some
+      // grouping client-side.
+      '--no-group-results'
+    ];
+
+    await this.runInterpretCommand(SARIF_FORMAT, additionalArgs, metadata, resultsPath, interpretedResultsPath, sourceInfo);
     return await sarifParser(interpretedResultsPath);
   }
 
+  // Warning: this function is untenable for large dot files,
+  async readDotFiles(dir: string): Promise<string[]> {
+    const dotFiles: Promise<string>[] = [];
+    for await (const file of walkDirectory(dir)) {
+      if (file.endsWith('.dot')) {
+        dotFiles.push(fs.readFile(file, 'utf8'));
+      }
+    }
+    return Promise.all(dotFiles);
+  }
+
+  async interpretBqrsGraph(metadata: QueryMetadata, resultsPath: string, interpretedResultsPath: string, sourceInfo?: SourceInfo): Promise<string[]> {
+    const additionalArgs = sourceInfo
+      ? ['--dot-location-url-format', 'file://' + sourceInfo.sourceLocationPrefix + '{path}:{start:line}:{start:column}:{end:line}:{end:column}']
+      : [];
+
+    await this.runInterpretCommand('dot', additionalArgs, metadata, resultsPath, interpretedResultsPath, sourceInfo);
+
+    try {
+      const dot = await this.readDotFiles(interpretedResultsPath);
+      return dot;
+    } catch (err) {
+      throw new Error(`Reading output of interpretation failed: ${err.stderr || err}`);
+    }
+  }
+
   async generateResultsCsv(metadata: QueryMetadata, resultsPath: string, csvPath: string, sourceInfo?: SourceInfo): Promise<void> {
-    await this.runInterpretCommand(CSV_FORMAT, metadata, resultsPath, csvPath, sourceInfo);
+    await this.runInterpretCommand(CSV_FORMAT, [], metadata, resultsPath, csvPath, sourceInfo);
   }
 
   async sortBqrs(resultsPath: string, sortedResultsPath: string, resultSet: string, sortKeys: number[], sortDirections: SortDirection[]): Promise<void> {
@@ -761,7 +802,7 @@ export class CodeQLCliServer implements Disposable {
    * @returns A list of database upgrade script directories
    */
   async resolveUpgrades(dbScheme: string, searchPath: string[], allowDowngradesIfPossible: boolean, targetDbScheme?: string): Promise<UpgradesInfo> {
-    const args = ['--additional-packs', searchPath.join(path.delimiter), '--dbscheme', dbScheme];
+    const args = [...this.getAdditionalPacksArg(searchPath), '--dbscheme', dbScheme];
     if (targetDbScheme) {
       args.push('--target-dbscheme', targetDbScheme);
       if (allowDowngradesIfPossible && await this.cliConstraints.supportsDowngrades()) {
@@ -783,7 +824,7 @@ export class CodeQLCliServer implements Disposable {
    * @returns A dictionary mapping qlpack name to the directory it comes from
    */
   resolveQlpacks(additionalPacks: string[], searchPath?: string[]): Promise<QlpacksInfo> {
-    const args = ['--additional-packs', additionalPacks.join(path.delimiter)];
+    const args = this.getAdditionalPacksArg(additionalPacks);
     if (searchPath?.length) {
       args.push('--search-path', path.join(...searchPath));
     }
@@ -829,7 +870,7 @@ export class CodeQLCliServer implements Disposable {
    * @returns A list of query files found.
    */
   async resolveQueriesInSuite(suite: string, additionalPacks: string[], searchPath?: string[]): Promise<string[]> {
-    const args = ['--additional-packs', additionalPacks.join(path.delimiter)];
+    const args = this.getAdditionalPacksArg(additionalPacks);
     if (searchPath !== undefined) {
       args.push('--search-path', path.join(...searchPath));
     }
@@ -845,6 +886,14 @@ export class CodeQLCliServer implements Disposable {
     );
   }
 
+  /**
+   * Downloads a specified pack.
+   * @param packs The `<package-scope/name[@version]>` of the packs to download.
+   */
+  async packDownload(packs: string[]) {
+    return this.runJsonCodeQlCliCommand(['pack', 'download'], packs, 'Downloading packs');
+  }
+
   async packInstall(dir: string) {
     return this.runJsonCodeQlCliCommand(['pack', 'install'], [dir], 'Installing pack dependencies');
   }
@@ -854,8 +903,7 @@ export class CodeQLCliServer implements Disposable {
       '-o',
       outputPath,
       dir,
-      '--additional-packs',
-      workspaceFolders.join(path.delimiter)
+      ...this.getAdditionalPacksArg(workspaceFolders)
     ];
     if (!precompile && await this.cliConstraints.supportsNoPrecompile()) {
       args.push('--no-precompile');
@@ -909,6 +957,12 @@ export class CodeQLCliServer implements Disposable {
         // the cli class is never instantiated.
         throw new Error('No distribution found');
     }
+  }
+
+  private getAdditionalPacksArg(paths: string[]): string[] {
+    return paths.length
+      ? ['--additional-packs', paths.join(path.delimiter)]
+      : [];
   }
 }
 
@@ -1191,6 +1245,17 @@ export class CliVersionConstraint {
    */
   public static CLI_VERSION_WITH_OLD_EVAL_STATS = new SemVer('2.7.4');
 
+  /**
+   * CLI version where packaging was introduced.
+   */
+  public static CLI_VERSION_WITH_PACKAGING = new SemVer('2.6.0');
+
+  /**
+   * CLI version where the `--evaluator-log` and related options to the query server were introduced,
+   * on a per-query server basis.
+   */
+  public static CLI_VERSION_WITH_STRUCTURED_EVAL_LOG = new SemVer('2.8.2');
+
   constructor(private readonly cli: CodeQLCliServer) {
     /**/
   }
@@ -1241,5 +1306,13 @@ export class CliVersionConstraint {
 
   async supportsOldEvalStats() {
     return this.isVersionAtLeast(CliVersionConstraint.CLI_VERSION_WITH_OLD_EVAL_STATS);
+  }
+
+  async supportsPackaging() {
+    return this.isVersionAtLeast(CliVersionConstraint.CLI_VERSION_WITH_PACKAGING);
+  }
+
+  async supportsStructuredEvalLog() {
+    return this.isVersionAtLeast(CliVersionConstraint.CLI_VERSION_WITH_STRUCTURED_EVAL_LOG);
   }
 }

@@ -14,7 +14,7 @@ import {
 import * as cli from './cli';
 import { CodeQLCliServer } from './cli';
 import { DatabaseEventKind, DatabaseItem, DatabaseManager } from './databases';
-import { showAndLogErrorMessage } from './helpers';
+import { showAndLogErrorMessage, tmpDir } from './helpers';
 import { assertNever } from './pure/helpers-pure';
 import {
   FromResultsViewMsg,
@@ -27,13 +27,14 @@ import {
   InterpretedResultsSortState,
   SortDirection,
   ALERTS_TABLE_NAME,
+  GRAPH_TABLE_NAME,
   RawResultsSortState,
 } from './pure/interface-types';
 import { Logger } from './logging';
 import * as messages from './pure/messages';
 import { commandRunner } from './commandRunner';
-import { CompletedQuery, interpretResults } from './query-results';
-import { QueryInfo, tmpDir } from './run-queries';
+import { CompletedQueryInfo, interpretResultsSarif, interpretGraphResults } from './query-results';
+import { QueryEvaluationInfo } from './run-queries';
 import { parseSarifLocation, parseSarifPlainTextMessage } from './pure/sarif-utils';
 import {
   WebviewReveal,
@@ -47,6 +48,7 @@ import {
 import { getDefaultResultSetName, ParsedResultSets } from './pure/interface-types';
 import { RawResultSet, transformBqrsResultSet, ResultSetSchema } from './pure/bqrs-cli-types';
 import { PAGE_SIZE } from './config';
+import { CompletedLocalQueryInfo } from './query-results';
 
 /**
  * interface.ts
@@ -87,16 +89,40 @@ function sortInterpretedResults(
   }
 }
 
-function numPagesOfResultSet(resultSet: RawResultSet): number {
-  return Math.ceil(resultSet.schema.rows / PAGE_SIZE.getValue<number>());
+function interpretedPageSize(interpretation: Interpretation | undefined): number {
+  if (interpretation?.data.t == 'GraphInterpretationData') {
+    // Graph views always have one result per page.
+    return 1;
+  }
+  return PAGE_SIZE.getValue<number>();
+}
+
+function numPagesOfResultSet(resultSet: RawResultSet, interpretation?: Interpretation): number {
+  const pageSize = interpretedPageSize(interpretation);
+
+  const n = interpretation?.data.t == 'GraphInterpretationData'
+    ? interpretation.data.dot.length
+    : resultSet.schema.rows;
+
+  return Math.ceil(n / pageSize);
 }
 
 function numInterpretedPages(interpretation: Interpretation | undefined): number {
-  return Math.ceil((interpretation?.sarif.runs[0].results?.length || 0) / PAGE_SIZE.getValue<number>());
+  if (!interpretation) {
+    return 0;
+  }
+
+  const pageSize = interpretedPageSize(interpretation);
+
+  const n = interpretation.data.t == 'GraphInterpretationData'
+    ? interpretation.data.dot.length
+    : interpretation.data.runs[0].results?.length || 0;
+
+  return Math.ceil(n / pageSize);
 }
 
 export class InterfaceManager extends DisposableObject {
-  private _displayedQuery?: CompletedQuery;
+  private _displayedQuery?: CompletedLocalQueryInfo;
   private _interpretation?: Interpretation;
   private _panel: vscode.WebviewPanel | undefined;
   private _panelLoaded = false;
@@ -160,10 +186,11 @@ export class InterfaceManager extends DisposableObject {
   getPanel(): vscode.WebviewPanel {
     if (this._panel == undefined) {
       const { ctx } = this;
+      const webViewColumn = this.chooseColumnForWebview();
       const panel = (this._panel = Window.createWebviewPanel(
         'resultsView', // internal name
         'CodeQL Query Results', // user-visible name
-        { viewColumn: vscode.ViewColumn.Beside, preserveFocus: true },
+        { viewColumn: webViewColumn, preserveFocus: true },
         {
           enableScripts: true,
           enableFindWidget: true,
@@ -175,32 +202,57 @@ export class InterfaceManager extends DisposableObject {
         }
       ));
 
-      this._panel.onDidDispose(
+      this.push(this._panel.onDidDispose(
         () => {
           this._panel = undefined;
           this._displayedQuery = undefined;
+          this._panelLoaded = false;
         },
         null,
         ctx.subscriptions
-      );
+      ));
       const scriptPathOnDisk = vscode.Uri.file(
         ctx.asAbsolutePath('out/resultsView.js')
       );
       const stylesheetPathOnDisk = vscode.Uri.file(
-        ctx.asAbsolutePath('out/resultsView.css')
+        ctx.asAbsolutePath('out/view/resultsView.css')
       );
       panel.webview.html = getHtmlForWebview(
         panel.webview,
         scriptPathOnDisk,
-        stylesheetPathOnDisk
+        [stylesheetPathOnDisk],
+        false
       );
-      panel.webview.onDidReceiveMessage(
+      this.push(panel.webview.onDidReceiveMessage(
         async (e) => this.handleMsgFromView(e),
         undefined,
         ctx.subscriptions
-      );
+      ));
     }
     return this._panel;
+  }
+
+  /**
+   * Choose where to open the webview.
+   *
+   * If there is a single view column, then open beside it.
+   * If there are multiple view columns, then open beside the active column,
+   * unless the active editor is the last column. In this case, open in the first column.
+   *
+   * The goal is to avoid opening new columns when there already are two columns open.
+   */
+  private chooseColumnForWebview(): vscode.ViewColumn {
+    // This is not a great way to determine the number of view columns, but I
+    // can't find a vscode API that does it any better.
+    // Here, iterate through all the visible editors and determine the max view column.
+    // This won't work if the largest view column is empty.
+    const colCount = Window.visibleTextEditors.reduce((maxVal, editor) =>
+      Math.max(maxVal, Number.parseInt(editor.viewColumn?.toFixed() || '0', 10)), 0);
+    if (colCount <= 1) {
+      return vscode.ViewColumn.Beside;
+    }
+    const activeViewColumnNum = Number.parseInt(Window.activeTextEditor?.viewColumn?.toFixed() || '0', 10);
+    return activeViewColumnNum === colCount ? vscode.ViewColumn.One : vscode.ViewColumn.Beside;
   }
 
   private async changeInterpretedSortState(
@@ -214,7 +266,7 @@ export class InterfaceManager extends DisposableObject {
     }
     // Notify the webview that it should expect new results.
     await this.postMessage({ t: 'resultsUpdating' });
-    await this._displayedQuery.updateInterpretedSortState(sortState);
+    await this._displayedQuery.completedQuery.updateInterpretedSortState(sortState);
     await this.showResults(this._displayedQuery, WebviewReveal.NotForced, true);
   }
 
@@ -230,7 +282,7 @@ export class InterfaceManager extends DisposableObject {
     }
     // Notify the webview that it should expect new results.
     await this.postMessage({ t: 'resultsUpdating' });
-    await this._displayedQuery.updateSortState(
+    await this._displayedQuery.completedQuery.updateSortState(
       this.cliServer,
       resultSetName,
       sortState
@@ -279,7 +331,7 @@ export class InterfaceManager extends DisposableObject {
           await this.changeInterpretedSortState(msg.sortState);
           break;
         case 'changePage':
-          if (msg.selectedTable === ALERTS_TABLE_NAME) {
+          if (msg.selectedTable === ALERTS_TABLE_NAME || msg.selectedTable === GRAPH_TABLE_NAME) {
             await this.showPageOfInterpretedResults(msg.pageNumber);
           }
           else {
@@ -290,7 +342,7 @@ export class InterfaceManager extends DisposableObject {
               // sortedResultsInfo doesn't have an entry for the current
               // result set. Use this to determine whether or not we use
               // the sorted bqrs file.
-              this._displayedQuery?.sortedResultsInfo.has(msg.selectedTable) || false
+              !!this._displayedQuery?.completedQuery.sortedResultsInfo[msg.selectedTable]
             );
           }
           break;
@@ -323,7 +375,7 @@ export class InterfaceManager extends DisposableObject {
 
   /**
    * Show query results in webview panel.
-   * @param results Evaluation info for the executed query.
+   * @param fullQuery Evaluation info for the executed query.
    * @param shouldKeepOldResultsWhileRendering Should keep old results while rendering.
    * @param forceReveal Force the webview panel to be visible and
    * Appropriate when the user has just performed an explicit
@@ -331,57 +383,59 @@ export class InterfaceManager extends DisposableObject {
    * history entry.
    */
   public async showResults(
-    results: CompletedQuery,
+    fullQuery: CompletedLocalQueryInfo,
     forceReveal: WebviewReveal,
     shouldKeepOldResultsWhileRendering = false
   ): Promise<void> {
-    if (results.result.resultType !== messages.QueryResultType.SUCCESS) {
+    if (fullQuery.completedQuery.result.resultType !== messages.QueryResultType.SUCCESS) {
       return;
     }
 
     this._interpretation = undefined;
     const interpretationPage = await this.interpretResultsInfo(
-      results.query,
-      results.interpretedResultsSortState
+      fullQuery.completedQuery.query,
+      fullQuery.completedQuery.interpretedResultsSortState
     );
 
     const sortedResultsMap: SortedResultsMap = {};
-    results.sortedResultsInfo.forEach(
-      (v, k) =>
+    Object.entries(fullQuery.completedQuery.sortedResultsInfo).forEach(
+      ([k, v]) =>
         (sortedResultsMap[k] = this.convertPathPropertiesToWebviewUris(v))
     );
 
-    this._displayedQuery = results;
+    this._displayedQuery = fullQuery;
 
     const panel = this.getPanel();
     await this.waitForPanelLoaded();
-    if (forceReveal === WebviewReveal.Forced) {
-      panel.reveal(undefined, true);
-    } else if (!panel.visible) {
-      // The results panel exists, (`.getPanel()` guarantees it) but
-      // is not visible; it's in a not-currently-viewed tab. Show a
-      // more asynchronous message to not so abruptly interrupt
-      // user's workflow by immediately revealing the panel.
-      const showButton = 'View Results';
-      const queryName = results.queryName;
-      const resultPromise = vscode.window.showInformationMessage(
-        `Finished running query ${queryName.length > 0 ? ` "${queryName}"` : ''
-        }.`,
-        showButton
-      );
-      // Address this click asynchronously so we still update the
-      // query history immediately.
-      void resultPromise.then((result) => {
-        if (result === showButton) {
-          panel.reveal();
-        }
-      });
+    if (!panel.visible) {
+      if (forceReveal === WebviewReveal.Forced) {
+        panel.reveal(undefined, true);
+      } else {
+        // The results panel exists, (`.getPanel()` guarantees it) but
+        // is not visible; it's in a not-currently-viewed tab. Show a
+        // more asynchronous message to not so abruptly interrupt
+        // user's workflow by immediately revealing the panel.
+        const showButton = 'View Results';
+        const queryName = fullQuery.getShortLabel();
+        const resultPromise = vscode.window.showInformationMessage(
+          `Finished running query ${queryName.length > 0 ? ` "${queryName}"` : ''
+          }.`,
+          showButton
+        );
+        // Address this click asynchronously so we still update the
+        // query history immediately.
+        void resultPromise.then((result) => {
+          if (result === showButton) {
+            panel.reveal();
+          }
+        });
+      }
     }
 
     // Note that the resultSetSchemas will return offsets for the default (unsorted) page,
     // which may not be correct. However, in this case, it doesn't matter since we only
     // need the first offset, which will be the same no matter which sorting we use.
-    const resultSetSchemas = await this.getResultSetSchemas(results);
+    const resultSetSchemas = await this.getResultSetSchemas(fullQuery.completedQuery);
     const resultSetNames = resultSetSchemas.map(schema => schema.name);
 
     const selectedTable = getDefaultResultSetName(resultSetNames);
@@ -391,7 +445,7 @@ export class InterfaceManager extends DisposableObject {
 
     // Use sorted results path if it exists. This may happen if we are
     // reloading the results view after it has been sorted in the past.
-    const resultsPath = results.getResultsPath(selectedTable);
+    const resultsPath = fullQuery.completedQuery.getResultsPath(selectedTable);
     const pageSize = PAGE_SIZE.getValue<number>();
     const chunk = await this.cliServer.bqrsDecode(
       resultsPath,
@@ -406,11 +460,11 @@ export class InterfaceManager extends DisposableObject {
       }
     );
     const resultSet = transformBqrsResultSet(schema, chunk);
-    results.setResultCount(interpretationPage?.numTotalResults || resultSet.schema.rows);
+    fullQuery.completedQuery.setResultCount(interpretationPage?.numTotalResults || resultSet.schema.rows);
     const parsedResultSets: ParsedResultSets = {
       pageNumber: 0,
       pageSize,
-      numPages: numPagesOfResultSet(resultSet),
+      numPages: numPagesOfResultSet(resultSet, this._interpretation),
       numInterpretedPages: numInterpretedPages(this._interpretation),
       resultSet: { ...resultSet, t: 'RawResultSet' },
       selectedTable: undefined,
@@ -420,17 +474,17 @@ export class InterfaceManager extends DisposableObject {
     await this.postMessage({
       t: 'setState',
       interpretation: interpretationPage,
-      origResultsPaths: results.query.resultsPaths,
+      origResultsPaths: fullQuery.completedQuery.query.resultsPaths,
       resultsPath: this.convertPathToWebviewUri(
-        results.query.resultsPaths.resultsPath
+        fullQuery.completedQuery.query.resultsPaths.resultsPath
       ),
       parsedResultSets,
       sortedResultsMap,
-      database: results.database,
+      database: fullQuery.initialInfo.databaseInfo,
       shouldKeepOldResultsWhileRendering,
-      metadata: results.query.metadata,
-      queryName: results.toString(),
-      queryPath: results.query.program.queryPath
+      metadata: fullQuery.completedQuery.query.metadata,
+      queryName: fullQuery.label,
+      queryPath: fullQuery.initialInfo.queryPath
     });
   }
 
@@ -446,29 +500,29 @@ export class InterfaceManager extends DisposableObject {
     if (this._interpretation === undefined) {
       throw new Error('Trying to show interpreted results but interpretation was undefined');
     }
-    if (this._interpretation.sarif.runs[0].results === undefined) {
+    if (this._interpretation.data.t === 'SarifInterpretationData' && this._interpretation.data.runs[0].results === undefined) {
       throw new Error('Trying to show interpreted results but results were undefined');
     }
 
-    const resultSetSchemas = await this.getResultSetSchemas(this._displayedQuery);
+    const resultSetSchemas = await this.getResultSetSchemas(this._displayedQuery.completedQuery);
     const resultSetNames = resultSetSchemas.map(schema => schema.name);
 
     await this.postMessage({
       t: 'showInterpretedPage',
       interpretation: this.getPageOfInterpretedResults(pageNumber),
-      database: this._displayedQuery.database,
-      metadata: this._displayedQuery.query.metadata,
+      database: this._displayedQuery.initialInfo.databaseInfo,
+      metadata: this._displayedQuery.completedQuery.query.metadata,
       pageNumber,
       resultSetNames,
-      pageSize: PAGE_SIZE.getValue(),
+      pageSize: interpretedPageSize(this._interpretation),
       numPages: numInterpretedPages(this._interpretation),
-      queryName: this._displayedQuery.toString(),
-      queryPath: this._displayedQuery.query.program.queryPath
+      queryName: this._displayedQuery.label,
+      queryPath: this._displayedQuery.initialInfo.queryPath
     });
   }
 
-  private async getResultSetSchemas(results: CompletedQuery, selectedTable = ''): Promise<ResultSetSchema[]> {
-    const resultsPath = results.getResultsPath(selectedTable);
+  private async getResultSetSchemas(completedQuery: CompletedQueryInfo, selectedTable = ''): Promise<ResultSetSchema[]> {
+    const resultsPath = completedQuery.getResultsPath(selectedTable);
     const schemas = await this.cliServer.bqrsInfo(
       resultsPath,
       PAGE_SIZE.getValue()
@@ -495,17 +549,17 @@ export class InterfaceManager extends DisposableObject {
     }
 
     const sortedResultsMap: SortedResultsMap = {};
-    results.sortedResultsInfo.forEach(
-      (v, k) =>
+    Object.entries(results.completedQuery.sortedResultsInfo).forEach(
+      ([k, v]) =>
         (sortedResultsMap[k] = this.convertPathPropertiesToWebviewUris(v))
     );
 
-    const resultSetSchemas = await this.getResultSetSchemas(results, sorted ? selectedTable : '');
+    const resultSetSchemas = await this.getResultSetSchemas(results.completedQuery, sorted ? selectedTable : '');
 
     // If there is a specific sorted table selected, a different bqrs file is loaded that doesn't have all the result set names.
     // Make sure that we load all result set names here.
     // See https://github.com/github/vscode-codeql/issues/1005
-    const allResultSetSchemas = sorted ? await this.getResultSetSchemas(results, '') : resultSetSchemas;
+    const allResultSetSchemas = sorted ? await this.getResultSetSchemas(results.completedQuery, '') : resultSetSchemas;
     const resultSetNames = allResultSetSchemas.map(schema => schema.name);
 
     const schema = resultSetSchemas.find(
@@ -516,7 +570,7 @@ export class InterfaceManager extends DisposableObject {
 
     const pageSize = PAGE_SIZE.getValue<number>();
     const chunk = await this.cliServer.bqrsDecode(
-      results.getResultsPath(selectedTable, sorted),
+      results.completedQuery.getResultsPath(selectedTable, sorted),
       schema.name,
       {
         offset: schema.pagination?.offsets[pageNumber],
@@ -538,17 +592,17 @@ export class InterfaceManager extends DisposableObject {
     await this.postMessage({
       t: 'setState',
       interpretation: this._interpretation,
-      origResultsPaths: results.query.resultsPaths,
+      origResultsPaths: results.completedQuery.query.resultsPaths,
       resultsPath: this.convertPathToWebviewUri(
-        results.query.resultsPaths.resultsPath
+        results.completedQuery.query.resultsPaths.resultsPath
       ),
       parsedResultSets,
       sortedResultsMap,
-      database: results.database,
+      database: results.initialInfo.databaseInfo,
       shouldKeepOldResultsWhileRendering: false,
-      metadata: results.query.metadata,
-      queryName: results.toString(),
-      queryPath: results.query.program.queryPath
+      metadata: results.completedQuery.query.metadata,
+      queryName: results.label,
+      queryPath: results.initialInfo.queryPath
     });
   }
 
@@ -563,28 +617,45 @@ export class InterfaceManager extends DisposableObject {
       void this.logger.log('No results path. Cannot display interpreted results.');
       return undefined;
     }
+    let data;
+    let numTotalResults;
+    if (metadata?.kind === GRAPH_TABLE_NAME) {
+      data = await interpretGraphResults(
+        this.cliServer,
+        metadata,
+        resultsPaths,
+        sourceInfo
+      );
+      numTotalResults = data.dot.length;
+    } else {
+      const sarif = await interpretResultsSarif(
+        this.cliServer,
+        metadata,
+        resultsPaths,
+        sourceInfo
+      );
 
-    const sarif = await interpretResults(
-      this.cliServer,
-      metadata,
-      resultsPaths,
-      sourceInfo
-    );
+      sarif.runs.forEach(run => {
+        if (run.results) {
+          sortInterpretedResults(run.results, sortState);
+        }
+      });
 
-    sarif.runs.forEach(run => {
-      if (run.results !== undefined) {
-        sortInterpretedResults(run.results, sortState);
-      }
-    });
+      sarif.sortState = sortState;
+      data = sarif;
 
-    const numTotalResults = sarif.runs[0]?.results?.length || 0;
+      numTotalResults = (() => {
+        return sarif.runs?.[0]?.results
+          ? sarif.runs[0].results.length
+          : 0;
+      })();
+    }
 
     const interpretation: Interpretation = {
-      sarif,
+      data,
       sourceLocationPrefix,
       numTruncatedResults: 0,
-      numTotalResults,
-      sortState,
+      numTotalResults
     };
     this._interpretation = interpretation;
     return interpretation;
@@ -593,7 +664,6 @@ export class InterfaceManager extends DisposableObject {
   private getPageOfInterpretedResults(
     pageNumber: number
   ): Interpretation {
-
     function getPageOfRun(run: Sarif.Run): Sarif.Run {
       return {
         ...run, results: run.results?.slice(
@@ -603,32 +673,44 @@ export class InterfaceManager extends DisposableObject {
       };
     }
 
-    if (this._interpretation === undefined) {
+    const interp = this._interpretation;
+    if (interp === undefined) {
       throw new Error('Tried to get interpreted results before interpretation finished');
     }
-    if (this._interpretation.sarif.runs.length !== 1) {
-      void this.logger.log(`Warning: SARIF file had ${this._interpretation.sarif.runs.length} runs, expected 1`);
+
+    if (interp.data.t !== 'SarifInterpretationData')
+      return interp;
+
+    if (interp.data.runs.length !== 1) {
+      void this.logger.log(`Warning: SARIF file had ${interp.data.runs.length} runs, expected 1`);
     }
-    const interp = this._interpretation;
+
     return {
       ...interp,
-      sarif: { ...interp.sarif, runs: [getPageOfRun(interp.sarif.runs[0])] },
+      data: {
+        ...interp.data,
+        runs: [getPageOfRun(interp.data.runs[0])]
+      }
     };
   }
 
   private async interpretResultsInfo(
-    query: QueryInfo,
+    query: QueryEvaluationInfo,
     sortState: InterpretedResultsSortState | undefined
   ): Promise<Interpretation | undefined> {
     if (
-      (await query.canHaveInterpretedResults()) &&
+      query.canHaveInterpretedResults() &&
       query.quickEvalPosition === undefined // never do results interpretation if quickEval
     ) {
       try {
-        const sourceLocationPrefix = await query.dbItem.getSourceLocationPrefix(
+        const dbItem = this.databaseManager.findDatabaseItem(Uri.file(query.dbItemPath));
+        if (!dbItem) {
+          throw new Error(`Could not find database item for ${query.dbItemPath}`);
+        }
+        const sourceLocationPrefix = await dbItem.getSourceLocationPrefix(
           this.cliServer
         );
-        const sourceArchiveUri = query.dbItem.sourceArchive;
+        const sourceArchiveUri = dbItem.sourceArchive;
         const sourceInfo =
           sourceArchiveUri === undefined
             ? undefined
@@ -698,9 +780,12 @@ export class InterfaceManager extends DisposableObject {
     interpretation: Interpretation,
     databaseItem: DatabaseItem
   ): Promise<void> {
-    const { sarif, sourceLocationPrefix } = interpretation;
+    const { data, sourceLocationPrefix } = interpretation;
 
-    if (!sarif.runs || !sarif.runs[0].results) {
+    if (data.t !== 'SarifInterpretationData')
+      return;
+
+    if (!data.runs || !data.runs[0].results) {
       void this.logger.log(
         'Didn\'t find a run in the sarif results. Error processing sarif?'
       );
@@ -709,7 +794,7 @@ export class InterfaceManager extends DisposableObject {
 
     const diagnostics: [Uri, ReadonlyArray<Diagnostic>][] = [];
 
-    for (const result of sarif.runs[0].results) {
+    for (const result of data.runs[0].results) {
       const message = result.message.text;
       if (message === undefined) {
         void this.logger.log('Sarif had result without plaintext message');

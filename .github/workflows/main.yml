@@ -22,7 +22,7 @@ jobs:
 
       - uses: actions/setup-node@v1
         with:
-          node-version: '14.14.0'
+          node-version: '16.13.0'
 
       - name: Install dependencies
         working-directory: extensions/ql-vscode
@@ -82,7 +82,7 @@ jobs:
 
       - uses: actions/setup-node@v1
         with:
-          node-version: '14.14.0'
+          node-version: '16.13.0'
 
       - name: Install dependencies
         working-directory: extensions/ql-vscode
@@ -135,7 +135,7 @@ jobs:
     strategy:
       matrix:
         os: [ubuntu-latest, windows-latest]
-        version: ['v2.3.3', 'v2.4.6', 'v2.5.9', 'v2.6.3', 'v2.7.3', 'nightly']
+        version: ['v2.3.3', 'v2.4.6', 'v2.5.9', 'v2.6.3', 'v2.7.6', 'v2.8.2', 'nightly']
     env:
       CLI_VERSION: ${{ matrix.version }}
       NIGHTLY_URL: ${{ needs.find-nightly.outputs.url }}
@@ -147,7 +147,7 @@ jobs:
 
       - uses: actions/setup-node@v1
         with:
-          node-version: '14.14.0'
+          node-version: '16.13.0'
 
       - name: Install dependencies
         working-directory: extensions/ql-vscode

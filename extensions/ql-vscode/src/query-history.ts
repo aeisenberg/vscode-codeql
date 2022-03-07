@@ -1,9 +1,22 @@
 import * as path from 'path';
-import * as vscode from 'vscode';
-import { window as Window, env } from 'vscode';
-import { CompletedQuery } from './query-results';
+import {
+  commands,
+  Disposable,
+  env,
+  Event,
+  EventEmitter,
+  ExtensionContext,
+  ProviderResult,
+  Range,
+  ThemeIcon,
+  TreeItem,
+  TreeView,
+  Uri,
+  ViewColumn,
+  window,
+  workspace,
+} from 'vscode';
 import { QueryHistoryConfig } from './config';
-import { QueryWithResults } from './run-queries';
 import {
   showAndLogErrorMessage,
   showAndLogInformationMessage,
@@ -15,7 +28,12 @@ import { URLSearchParams } from 'url';
 import { QueryServerClient } from './queryserver-client';
 import { DisposableObject } from './pure/disposable-object';
 import { commandRunner } from './commandRunner';
-import { assertNever } from './pure/helpers-pure';
+import { assertNever, ONE_HOUR_IN_MS, TWO_HOURS_IN_MS } from './pure/helpers-pure';
+import { CompletedLocalQueryInfo, LocalQueryInfo as LocalQueryInfo, QueryHistoryInfo } from './query-results';
+import { DatabaseManager } from './databases';
+import { registerQueryHistoryScubber } from './query-history-scrubber';
+import { QueryStatus } from './query-status';
+import { slurpQueryHistory, splatQueryHistory } from './query-serialization';
 
 /**
  * query-history.ts
@@ -26,13 +44,7 @@ import { assertNever } from './pure/helpers-pure';
  * `TreeDataProvider` subclass below.
  */
 
-export type QueryHistoryItemOptions = {
-  label?: string; // user-settable label
-  queryText?: string; // text of the selected file
-  isQuickQuery?: boolean;
-};
-
-const SHOW_QUERY_TEXT_MSG = `\
+export const SHOW_QUERY_TEXT_MSG = `\
 ////////////////////////////////////////////////////////////////////////////////////
 // This is the text of the entire query file when it was executed for this query  //
 // run. The text or dependent libraries may have changed since then.              //
@@ -59,7 +71,17 @@ const SHOW_QUERY_TEXT_QUICK_EVAL_MSG = `\
  */
 const FAILED_QUERY_HISTORY_ITEM_ICON = 'media/red-x.svg';
 
-enum SortOrder {
+/**
+ * Path to icon to display next to a successful local run.
+ */
+const LOCAL_SUCCESS_QUERY_HISTORY_ITEM_ICON = 'media/drive.svg';
+
+/**
+ * Path to icon to display next to a successful remote run.
+ */
+const REMOTE_SUCCESS_QUERY_HISTORY_ITEM_ICON = 'media/globe.svg';
+
+export enum SortOrder {
   NameAsc = 'NameAsc',
   NameDesc = 'NameDesc',
   DateAsc = 'DateAsc',
@@ -69,24 +91,33 @@ enum SortOrder {
 }
 
 /**
+ * Number of milliseconds two clicks have to arrive apart to be
+ * considered a double-click.
+ */
+const DOUBLE_CLICK_TIME = 500;
+
+const WORKSPACE_QUERY_HISTORY_FILE = 'workspace-query-history.json';
+
+/**
  * Tree data provider for the query history view.
  */
 export class HistoryTreeDataProvider extends DisposableObject {
   private _sortOrder = SortOrder.DateAsc;
 
-  private _onDidChangeTreeData = super.push(new vscode.EventEmitter<CompletedQuery | undefined>());
+  private _onDidChangeTreeData = super.push(new EventEmitter<QueryHistoryInfo | undefined>());
 
-  readonly onDidChangeTreeData: vscode.Event<CompletedQuery | undefined> = this
+  readonly onDidChangeTreeData: Event<QueryHistoryInfo | undefined> = this
     ._onDidChangeTreeData.event;
 
-  private history: CompletedQuery[] = [];
+  private history: QueryHistoryInfo[] = [];
 
   private failedIconPath: string;
 
-  /**
-   * When not undefined, must be reference-equal to an item in `this.databases`.
-   */
-  private current: CompletedQuery | undefined;
+  private localSuccessIconPath: string;
+
+  private remoteSuccessIconPath: string;
+
+  private current: QueryHistoryInfo | undefined;
 
   constructor(extensionPath: string) {
     super();
@@ -94,97 +125,148 @@ export class HistoryTreeDataProvider extends DisposableObject {
       extensionPath,
       FAILED_QUERY_HISTORY_ITEM_ICON
     );
+    this.localSuccessIconPath = path.join(
+      extensionPath,
+      LOCAL_SUCCESS_QUERY_HISTORY_ITEM_ICON
+    );
+    this.remoteSuccessIconPath = path.join(
+      extensionPath,
+      REMOTE_SUCCESS_QUERY_HISTORY_ITEM_ICON
+    );
   }
 
-  async getTreeItem(element: CompletedQuery): Promise<vscode.TreeItem> {
-    const treeItem = new vscode.TreeItem(element.toString());
+  async getTreeItem(element: QueryHistoryInfo): Promise<TreeItem> {
+    const treeItem = new TreeItem(element.label);
 
     treeItem.command = {
       title: 'Query History Item',
       command: 'codeQLQueryHistory.itemClicked',
       arguments: [element],
+      tooltip: element.failureReason || element.label
     };
 
-    // Mark this query history item according to whether it has a
-    // SARIF file so that we can make context menu items conditionally
-    // available.
-    const hasResults = await element.query.hasInterpretedResults();
-    treeItem.contextValue = hasResults
-      ? 'interpretedResultsItem'
-      : 'rawResultsItem';
-
-    if (!element.didRunSuccessfully) {
-      treeItem.iconPath = this.failedIconPath;
+    // Populate the icon and the context value. We use the context value to
+    // control which commands are visible in the context menu.
+    let hasResults;
+    switch (element.status) {
+      case QueryStatus.InProgress:
+        treeItem.iconPath = new ThemeIcon('sync~spin');
+        treeItem.contextValue = element.t === 'local' ? 'inProgressResultsItem' : 'inProgressRemoteResultsItem';
+        break;
+      case QueryStatus.Completed:
+        if (element.t === 'local') {
+          hasResults = await element.completedQuery?.query.hasInterpretedResults();
+          treeItem.iconPath = this.localSuccessIconPath;
+          treeItem.contextValue = hasResults
+            ? 'interpretedResultsItem'
+            : 'rawResultsItem';
+        } else {
+          treeItem.iconPath = this.remoteSuccessIconPath;
+          treeItem.contextValue = 'remoteResultsItem';
+        }
+        break;
+      case QueryStatus.Failed:
+        treeItem.iconPath = this.failedIconPath;
+        treeItem.contextValue = 'cancelledResultsItem';
+        break;
+      default:
+        assertNever(element.status);
     }
 
     return treeItem;
   }
 
   getChildren(
-    element?: CompletedQuery
-  ): vscode.ProviderResult<CompletedQuery[]> {
-    return element ? [] : this.history.sort((q1, q2) => {
+    element?: QueryHistoryInfo
+  ): ProviderResult<QueryHistoryInfo[]> {
+    return element ? [] : this.history.sort((h1, h2) => {
+
+      // TODO remote queries are not implemented yet.
+      if (h1.t !== 'local' && h2.t !== 'local') {
+        return 0;
+      }
+      if (h1.t !== 'local') {
+        return -1;
+      }
+      if (h2.t !== 'local') {
+        return 1;
+      }
+
+      const resultCount1 = h1.completedQuery?.resultCount ?? -1;
+      const resultCount2 = h2.completedQuery?.resultCount ?? -1;
+
       switch (this.sortOrder) {
         case SortOrder.NameAsc:
-          return q1.toString().localeCompare(q2.toString(), env.language);
+          return h1.label.localeCompare(h2.label, env.language);
         case SortOrder.NameDesc:
-          return q2.toString().localeCompare(q1.toString(), env.language);
+          return h2.label.localeCompare(h1.label, env.language);
         case SortOrder.DateAsc:
-          return q1.date.getTime() - q2.date.getTime();
+          return h1.initialInfo.start.getTime() - h2.initialInfo.start.getTime();
         case SortOrder.DateDesc:
-          return q2.date.getTime() - q1.date.getTime();
+          return h2.initialInfo.start.getTime() - h1.initialInfo.start.getTime();
         case SortOrder.CountAsc:
-          return q1.resultCount - q2.resultCount;
+          // If the result counts are equal, sort by name.
+          return resultCount1 - resultCount2 === 0
+            ? h1.label.localeCompare(h2.label, env.language)
+            : resultCount1 - resultCount2;
         case SortOrder.CountDesc:
-          return q2.resultCount - q1.resultCount;
+          // If the result counts are equal, sort by name.
+          return resultCount2 - resultCount1 === 0
+            ? h2.label.localeCompare(h1.label, env.language)
+            : resultCount2 - resultCount1;
         default:
           assertNever(this.sortOrder);
       }
     });
   }
 
-  getParent(_element: CompletedQuery): vscode.ProviderResult<CompletedQuery> {
+  getParent(_element: QueryHistoryInfo): ProviderResult<QueryHistoryInfo> {
     return null;
   }
 
-  getCurrent(): CompletedQuery | undefined {
+  getCurrent(): QueryHistoryInfo | undefined {
     return this.current;
   }
 
-  pushQuery(item: CompletedQuery): void {
-    this.current = item;
+  pushQuery(item: QueryHistoryInfo): void {
     this.history.push(item);
+    this.setCurrentItem(item);
     this.refresh();
   }
 
-  setCurrentItem(item: CompletedQuery) {
+  setCurrentItem(item?: QueryHistoryInfo) {
     this.current = item;
   }
 
-  remove(item: CompletedQuery) {
-    if (this.current === item) this.current = undefined;
+  remove(item: QueryHistoryInfo) {
+    const isCurrent = this.current === item;
+    if (isCurrent) {
+      this.setCurrentItem();
+    }
     const index = this.history.findIndex((i) => i === item);
     if (index >= 0) {
       this.history.splice(index, 1);
-      if (this.current === undefined && this.history.length > 0) {
+      if (isCurrent && this.history.length > 0) {
         // Try to keep a current item, near the deleted item if there
         // are any available.
-        this.current = this.history[Math.min(index, this.history.length - 1)];
+        this.setCurrentItem(this.history[Math.min(index, this.history.length - 1)]);
       }
       this.refresh();
     }
   }
 
-  get allHistory(): CompletedQuery[] {
+  get allHistory(): QueryHistoryInfo[] {
     return this.history;
   }
 
-  refresh(completedQuery?: CompletedQuery) {
-    this._onDidChangeTreeData.fire(completedQuery);
+  set allHistory(history: QueryHistoryInfo[]) {
+    this.history = history;
+    this.current = history[0];
+    this.refresh();
   }
 
-  find(queryId: number): CompletedQuery | undefined {
-    return this.allHistory.find((query) => query.query.queryID === queryId);
+  refresh() {
+    this._onDidChangeTreeData.fire(undefined);
   }
 
   public get sortOrder() {
@@ -197,40 +279,53 @@ export class HistoryTreeDataProvider extends DisposableObject {
   }
 }
 
-/**
- * Number of milliseconds two clicks have to arrive apart to be
- * considered a double-click.
- */
-const DOUBLE_CLICK_TIME = 500;
-
-const NO_QUERY_SELECTED = 'No query selected. Select a query history item you have already run and try again.';
 export class QueryHistoryManager extends DisposableObject {
+
   treeDataProvider: HistoryTreeDataProvider;
-  treeView: vscode.TreeView<CompletedQuery>;
-  lastItemClick: { time: Date; item: CompletedQuery } | undefined;
-  compareWithItem: CompletedQuery | undefined;
+  treeView: TreeView<QueryHistoryInfo>;
+  lastItemClick: { time: Date; item: QueryHistoryInfo } | undefined;
+  compareWithItem: LocalQueryInfo | undefined;
+  queryHistoryScrubber: Disposable | undefined;
+  private queryMetadataStorageLocation;
+
+  private readonly _onDidAddQueryItem = super.push(new EventEmitter<QueryHistoryInfo>());
+  readonly onDidAddQueryItem: Event<QueryHistoryInfo> = this
+    ._onDidAddQueryItem.event;
+
+  private readonly _onDidRemoveQueryItem = super.push(new EventEmitter<QueryHistoryInfo>());
+  readonly onDidRemoveQueryItem: Event<QueryHistoryInfo> = this
+    ._onDidRemoveQueryItem.event;
+
+  private readonly _onWillOpenQueryItem = super.push(new EventEmitter<QueryHistoryInfo>());
+  readonly onWillOpenQueryItem: Event<QueryHistoryInfo> = this
+    ._onWillOpenQueryItem.event;
 
   constructor(
     private qs: QueryServerClient,
-    extensionPath: string,
+    private dbm: DatabaseManager,
+    private queryStorageDir: string,
+    ctx: ExtensionContext,
     private queryHistoryConfigListener: QueryHistoryConfig,
-    private selectedCallback: (item: CompletedQuery) => Promise<void>,
     private doCompareCallback: (
-      from: CompletedQuery,
-      to: CompletedQuery
+      from: CompletedLocalQueryInfo,
+      to: CompletedLocalQueryInfo
     ) => Promise<void>
   ) {
     super();
 
-    const treeDataProvider = (this.treeDataProvider = new HistoryTreeDataProvider(
-      extensionPath
+    // Note that we use workspace storage to hold the metadata for the query history.
+    // This is because the query history is specific to each workspace.
+    // For situations where `ctx.storageUri` is undefined (i.e., there is no workspace),
+    // we default to global storage.
+    this.queryMetadataStorageLocation = path.join((ctx.storageUri || ctx.globalStorageUri).fsPath, WORKSPACE_QUERY_HISTORY_FILE);
+
+    this.treeDataProvider = this.push(new HistoryTreeDataProvider(
+      ctx.extensionPath
     ));
-    this.treeView = Window.createTreeView('codeQLQueryHistory', {
-      treeDataProvider,
+    this.treeView = this.push(window.createTreeView('codeQLQueryHistory', {
+      treeDataProvider: this.treeDataProvider,
       canSelectMany: true,
-    });
-    this.push(this.treeView);
-    this.push(treeDataProvider);
+    }));
 
     // Lazily update the tree view selection due to limitations of TreeView API (see
     // `updateTreeViewSelectionIfVisible` doc for details)
@@ -239,13 +334,20 @@ export class QueryHistoryManager extends DisposableObject {
         this.updateTreeViewSelectionIfVisible()
       )
     );
-    // Don't allow the selection to become empty
     this.push(
       this.treeView.onDidChangeSelection(async (ev) => {
-        if (ev.selection.length == 0) {
+        if (ev.selection.length === 0) {
+          // Don't allow the selection to become empty
           this.updateTreeViewSelectionIfVisible();
+        } else {
+          this.treeDataProvider.setCurrentItem(ev.selection[0]);
         }
-        this.updateCompareWith(ev.selection);
+        if (ev.selection.some(item => item.t !== 'local')) {
+          // Don't allow comparison of non-local items
+          this.updateCompareWith([]);
+        } else {
+          this.updateCompareWith([...ev.selection] as LocalQueryInfo[]);
+        }
       })
     );
 
@@ -300,6 +402,18 @@ export class QueryHistoryManager extends DisposableObject {
     );
     this.push(
       commandRunner(
+        'codeQLQueryHistory.openQueryDirectory',
+        this.handleOpenQueryDirectory.bind(this)
+      )
+    );
+    this.push(
+      commandRunner(
+        'codeQLQueryHistory.cancel',
+        this.handleCancel.bind(this)
+      )
+    );
+    this.push(
+      commandRunner(
         'codeQLQueryHistory.showQueryText',
         this.handleShowQueryText.bind(this)
       )
@@ -331,20 +445,36 @@ export class QueryHistoryManager extends DisposableObject {
     this.push(
       commandRunner(
         'codeQLQueryHistory.itemClicked',
-        async (item: CompletedQuery) => {
+        async (item: LocalQueryInfo) => {
           return this.handleItemClicked(item, [item]);
         }
       )
     );
-    queryHistoryConfigListener.onDidChangeConfiguration(() => {
-      this.treeDataProvider.refresh();
-    });
+    this.push(
+      commandRunner(
+        'codeQLQueryHistory.openOnGithub',
+        async (item: LocalQueryInfo) => {
+          return this.handleOpenOnGithub(item, [item]);
+        }
+      )
+    );
+
+    // There are two configuration items that affect the query history:
+    // 1. The ttl for query history items.
+    // 2. The default label for query history items.
+    // When either of these change, must refresh the tree view.
+    this.push(
+      queryHistoryConfigListener.onDidChangeConfiguration(() => {
+        this.treeDataProvider.refresh();
+        this.registerQueryHistoryScrubber(queryHistoryConfigListener, ctx);
+      })
+    );
 
     // displays query text in a read-only document
-    vscode.workspace.registerTextDocumentContentProvider('codeql', {
+    this.push(workspace.registerTextDocumentContentProvider('codeql', {
       provideTextDocumentContent(
-        uri: vscode.Uri
-      ): vscode.ProviderResult<string> {
+        uri: Uri
+      ): ProviderResult<string> {
         const params = new URLSearchParams(uri.query);
 
         return (
@@ -353,63 +483,112 @@ export class QueryHistoryManager extends DisposableObject {
             : SHOW_QUERY_TEXT_MSG) + params.get('queryText')
         );
       },
+    }));
+
+    this.registerQueryHistoryScrubber(queryHistoryConfigListener, ctx);
+  }
+
+  /**
+   * Register and create the history scrubber.
+   */
+  private registerQueryHistoryScrubber(queryHistoryConfigListener: QueryHistoryConfig, ctx: ExtensionContext) {
+    this.queryHistoryScrubber?.dispose();
+    // Every hour check if we need to re-run the query history scrubber.
+    this.queryHistoryScrubber = this.push(
+      registerQueryHistoryScubber(
+        ONE_HOUR_IN_MS,
+        TWO_HOURS_IN_MS,
+        queryHistoryConfigListener.ttlInMillis,
+        this.queryStorageDir,
+        ctx
+      )
+    );
+  }
+
+  async readQueryHistory(): Promise<void> {
+    void logger.log(`Reading cached query history from '${this.queryMetadataStorageLocation}'.`);
+    const history = await slurpQueryHistory(this.queryMetadataStorageLocation, this.queryHistoryConfigListener);
+    this.treeDataProvider.allHistory = history;
+    this.treeDataProvider.allHistory.forEach((item) => {
+      this._onDidAddQueryItem.fire(item);
     });
   }
 
-  async invokeCallbackOn(queryHistoryItem: CompletedQuery) {
-    if (this.selectedCallback !== undefined) {
-      const sc = this.selectedCallback;
-      await sc(queryHistoryItem);
-    }
+  async writeQueryHistory(): Promise<void> {
+    await splatQueryHistory(this.treeDataProvider.allHistory, this.queryMetadataStorageLocation);
   }
 
   async handleOpenQuery(
-    singleItem: CompletedQuery,
-    multiSelect: CompletedQuery[]
+    singleItem: QueryHistoryInfo,
+    multiSelect: QueryHistoryInfo[]
   ): Promise<void> {
     const { finalSingleItem, finalMultiSelect } = this.determineSelection(singleItem, multiSelect);
-    if (!this.assertSingleQuery(finalMultiSelect)) {
+    if (!this.assertSingleQuery(finalMultiSelect) || !finalSingleItem) {
       return;
     }
 
-    if (!finalSingleItem) {
-      throw new Error(NO_QUERY_SELECTED);
-    }
+    const queryPath = finalSingleItem.t === 'local'
+      ? finalSingleItem.initialInfo.queryPath
+      : finalSingleItem.remoteQuery.queryFilePath;
 
-    const textDocument = await vscode.workspace.openTextDocument(
-      vscode.Uri.file(finalSingleItem.query.program.queryPath)
+    const textDocument = await workspace.openTextDocument(
+      Uri.file(queryPath)
     );
-    const editor = await vscode.window.showTextDocument(
+    const editor = await window.showTextDocument(
       textDocument,
-      vscode.ViewColumn.One
+      ViewColumn.One
     );
-    const queryText = finalSingleItem.options.queryText;
-    if (queryText !== undefined && finalSingleItem.options.isQuickQuery) {
-      await editor.edit((edit) =>
-        edit.replace(
-          textDocument.validateRange(
-            new vscode.Range(0, 0, textDocument.lineCount, 0)
-          ),
-          queryText
-        )
-      );
+
+    if (finalSingleItem.t === 'local') {
+      const queryText = finalSingleItem.initialInfo.queryText;
+      if (queryText !== undefined && finalSingleItem.initialInfo.isQuickQuery) {
+        await editor.edit((edit) =>
+          edit.replace(
+            textDocument.validateRange(
+              new Range(0, 0, textDocument.lineCount, 0)
+            ),
+            queryText
+          )
+        );
+      }
     }
   }
 
   async handleRemoveHistoryItem(
-    singleItem: CompletedQuery,
-    multiSelect: CompletedQuery[]
+    singleItem: QueryHistoryInfo,
+    multiSelect: QueryHistoryInfo[] = []
   ) {
     const { finalSingleItem, finalMultiSelect } = this.determineSelection(singleItem, multiSelect);
+    const toDelete = (finalMultiSelect || [finalSingleItem]);
+    await Promise.all(toDelete.map(async (item) => {
+      if (item.t === 'local') {
+        // Removing in progress local queries is not supported. They must be cancelled first.
+        if (item.status !== QueryStatus.InProgress) {
+          this.treeDataProvider.remove(item);
+          item.completedQuery?.dispose();
 
-    (finalMultiSelect || [finalSingleItem]).forEach((item) => {
-      this.treeDataProvider.remove(item);
-      item.dispose();
-    });
+          // User has explicitly asked for this query to be removed.
+          // We need to delete it from disk as well.
+          await item.completedQuery?.query.deleteQuery();
+        }
+      } else {
+        // Remote queries can be removed locally, but not remotely.
+        // The user must cancel the query on GitHub Actions explicitly.
+        this.treeDataProvider.remove(item);
+        void logger.log(`Deleted ${item.label}.`);
+        if (item.status === QueryStatus.InProgress) {
+          void logger.log('The remote query is still running on GitHub Actions. To cancel there, you must go to the query run in your browser.');
+        }
+
+        this._onDidRemoveQueryItem.fire(item);
+      }
+
+    }));
+    await this.writeQueryHistory();
     const current = this.treeDataProvider.getCurrent();
     if (current !== undefined) {
-      await this.treeView.reveal(current);
-      await this.invokeCallbackOn(current);
+      await this.treeView.reveal(current, { select: true });
+      this._onWillOpenQueryItem.fire(current);
     }
   }
 
@@ -438,45 +617,50 @@ export class QueryHistoryManager extends DisposableObject {
   }
 
   async handleSetLabel(
-    singleItem: CompletedQuery,
-    multiSelect: CompletedQuery[]
+    singleItem: QueryHistoryInfo,
+    multiSelect: QueryHistoryInfo[]
   ): Promise<void> {
-    if (!this.assertSingleQuery(multiSelect)) {
+    const { finalSingleItem, finalMultiSelect } = this.determineSelection(singleItem, multiSelect);
+
+    // TODO will support remote queries
+    if (!this.assertSingleQuery(finalMultiSelect) || finalSingleItem?.t !== 'local') {
       return;
     }
 
-    const response = await vscode.window.showInputBox({
+    const response = await window.showInputBox({
       prompt: 'Label:',
       placeHolder: '(use default)',
-      value: singleItem.getLabel(),
+      value: finalSingleItem.label,
     });
     // undefined response means the user cancelled the dialog; don't change anything
     if (response !== undefined) {
       // Interpret empty string response as 'go back to using default'
-      singleItem.options.label = response === '' ? undefined : response;
-      if (this.treeDataProvider.sortOrder === SortOrder.NameAsc ||
-        this.treeDataProvider.sortOrder === SortOrder.NameDesc) {
-        this.treeDataProvider.refresh();
-      } else {
-        this.treeDataProvider.refresh(singleItem);
-      }
+      finalSingleItem.initialInfo.userSpecifiedLabel = response === '' ? undefined : response;
+      this.treeDataProvider.refresh();
     }
   }
 
   async handleCompareWith(
-    singleItem: CompletedQuery,
-    multiSelect: CompletedQuery[]
+    singleItem: QueryHistoryInfo,
+    multiSelect: QueryHistoryInfo[]
   ) {
+    const { finalSingleItem, finalMultiSelect } = this.determineSelection(singleItem, multiSelect);
+
     try {
-      if (!singleItem.didRunSuccessfully) {
-        throw new Error('Please select a successful query.');
+      // local queries only
+      if (finalSingleItem?.t !== 'local') {
+        throw new Error('Please select a local query.');
+      }
+
+      if (!finalSingleItem.completedQuery?.didRunSuccessfully) {
+        throw new Error('Please select a query that has completed successfully.');
       }
 
       const from = this.compareWithItem || singleItem;
-      const to = await this.findOtherQueryToCompare(from, multiSelect);
+      const to = await this.findOtherQueryToCompare(from, finalMultiSelect);
 
-      if (from && to) {
-        await this.doCompareCallback(from, to);
+      if (from.completed && to?.completed) {
+        await this.doCompareCallback(from as CompletedLocalQueryInfo, to as CompletedLocalQueryInfo);
       }
     } catch (e) {
       void showAndLogErrorMessage(e.message);
@@ -484,16 +668,12 @@ export class QueryHistoryManager extends DisposableObject {
   }
 
   async handleItemClicked(
-    singleItem: CompletedQuery,
-    multiSelect: CompletedQuery[]
+    singleItem: QueryHistoryInfo,
+    multiSelect: QueryHistoryInfo[] = []
   ) {
     const { finalSingleItem, finalMultiSelect } = this.determineSelection(singleItem, multiSelect);
-    if (!this.assertSingleQuery(finalMultiSelect)) {
+    if (!this.assertSingleQuery(finalMultiSelect) || !finalSingleItem) {
       return;
-    }
-
-    if (!finalSingleItem) {
-      throw new Error(NO_QUERY_SELECTED);
     }
 
     this.treeDataProvider.setCurrentItem(finalSingleItem);
@@ -510,67 +690,120 @@ export class QueryHistoryManager extends DisposableObject {
       // show original query file on double click
       await this.handleOpenQuery(finalSingleItem, [finalSingleItem]);
     } else {
-      // show results on single click
-      await this.invokeCallbackOn(finalSingleItem);
+      // show results on single click only if query is completed successfully.
+      if (finalSingleItem.status === QueryStatus.Completed) {
+        await this._onWillOpenQueryItem.fire(finalSingleItem);
+      }
     }
   }
 
   async handleShowQueryLog(
-    singleItem: CompletedQuery,
-    multiSelect: CompletedQuery[]
+    singleItem: QueryHistoryInfo,
+    multiSelect: QueryHistoryInfo[]
   ) {
-    if (!this.assertSingleQuery(multiSelect)) {
+    // Local queries only
+    if (!this.assertSingleQuery(multiSelect) || singleItem?.t !== 'local') {
       return;
     }
 
-    if (singleItem.logFileLocation) {
-      await this.tryOpenExternalFile(singleItem.logFileLocation);
+    if (!singleItem.completedQuery) {
+      return;
+    }
+
+    if (singleItem.completedQuery.logFileLocation) {
+      await this.tryOpenExternalFile(singleItem.completedQuery.logFileLocation);
     } else {
       void showAndLogWarningMessage('No log file available');
     }
   }
 
-  async handleShowQueryText(
-    singleItem: CompletedQuery,
-    multiSelect: CompletedQuery[]
+  async handleOpenQueryDirectory(
+    singleItem: QueryHistoryInfo,
+    multiSelect: QueryHistoryInfo[]
   ) {
-    if (!this.assertSingleQuery(multiSelect)) {
+    const { finalSingleItem, finalMultiSelect } = this.determineSelection(singleItem, multiSelect);
+
+    if (!this.assertSingleQuery(finalMultiSelect) || !finalSingleItem) {
       return;
     }
 
-    if (!singleItem) {
-      throw new Error(NO_QUERY_SELECTED);
+    let p: string | undefined;
+    if (finalSingleItem.t === 'local') {
+      if (finalSingleItem.completedQuery) {
+        p = finalSingleItem.completedQuery.query.querySaveDir;
+      }
+    } else if (finalSingleItem.t === 'remote') {
+      p = path.join(this.queryStorageDir, finalSingleItem.queryId);
     }
 
-    const queryName = singleItem.queryName.endsWith('.ql')
-      ? singleItem.queryName
-      : singleItem.queryName + '.ql';
-    const params = new URLSearchParams({
-      isQuickEval: String(!!singleItem.query.quickEvalPosition),
-      queryText: encodeURIComponent(await this.getQueryText(singleItem)),
+    if (p) {
+      try {
+        await commands.executeCommand('revealFileInOS', Uri.file(p));
+      } catch (e) {
+        throw new Error(`Failed to open ${p}: ${e.message}`);
+      }
+    }
+  }
+
+  async handleCancel(
+    singleItem: QueryHistoryInfo,
+    multiSelect: QueryHistoryInfo[]
+  ) {
+    // Local queries only
+    // In the future, we may support cancelling remote queries, but this is not a short term plan.
+    const { finalSingleItem, finalMultiSelect } = this.determineSelection(singleItem, multiSelect);
+
+    (finalMultiSelect || [finalSingleItem]).forEach((item) => {
+      if (item.status === QueryStatus.InProgress && item.t === 'local') {
+        item.cancel();
+      }
     });
-    const uri = vscode.Uri.parse(
-      `codeql:${singleItem.query.queryID}-${queryName}?${params.toString()}`, true
+  }
+
+  async handleShowQueryText(
+    singleItem: QueryHistoryInfo,
+    multiSelect: QueryHistoryInfo[] = []
+  ) {
+    const { finalSingleItem, finalMultiSelect } = this.determineSelection(singleItem, multiSelect);
+
+    if (!this.assertSingleQuery(finalMultiSelect) || !finalSingleItem) {
+      return;
+    }
+
+    const params = new URLSearchParams({
+      isQuickEval: String(!!(finalSingleItem.t === 'local' && finalSingleItem.initialInfo.quickEvalPosition)),
+      queryText: encodeURIComponent(await this.getQueryText(finalSingleItem)),
+    });
+    const queryId = finalSingleItem.t === 'local'
+      ? finalSingleItem.initialInfo.id
+      : finalSingleItem.queryId;
+
+    const uri = Uri.parse(
+      `codeql:${queryId}?${params.toString()}`, true
     );
-    const doc = await vscode.workspace.openTextDocument(uri);
-    await vscode.window.showTextDocument(doc, { preview: false });
+    const doc = await workspace.openTextDocument(uri);
+    await window.showTextDocument(doc, { preview: false });
   }
 
   async handleViewSarifAlerts(
-    singleItem: CompletedQuery,
-    multiSelect: CompletedQuery[]
+    singleItem: QueryHistoryInfo,
+    multiSelect: QueryHistoryInfo[]
   ) {
-    if (!this.assertSingleQuery(multiSelect)) {
+    const { finalSingleItem, finalMultiSelect } = this.determineSelection(singleItem, multiSelect);
+
+    // Local queries only
+    if (!this.assertSingleQuery(finalMultiSelect) || !finalSingleItem || finalSingleItem.t !== 'local' || !finalSingleItem.completedQuery) {
       return;
     }
 
-    const hasInterpretedResults = await singleItem.query.canHaveInterpretedResults();
+    const query = finalSingleItem.completedQuery.query;
+    const hasInterpretedResults = query.canHaveInterpretedResults();
     if (hasInterpretedResults) {
       await this.tryOpenExternalFile(
-        singleItem.query.resultsPaths.interpretedResultsPath
+        query.resultsPaths.interpretedResultsPath
       );
     } else {
-      const label = singleItem.getLabel();
+      const label = finalSingleItem.label;
       void showAndLogInformationMessage(
         `Query ${label} has no interpreted results.`
       );
@@ -578,79 +811,88 @@ export class QueryHistoryManager extends DisposableObject {
   }
 
   async handleViewCsvResults(
-    singleItem: CompletedQuery,
-    multiSelect: CompletedQuery[]
+    singleItem: QueryHistoryInfo,
+    multiSelect: QueryHistoryInfo[]
   ) {
-    if (!this.assertSingleQuery(multiSelect)) {
+    const { finalSingleItem, finalMultiSelect } = this.determineSelection(singleItem, multiSelect);
+
+    // Local queries only
+    if (!this.assertSingleQuery(finalMultiSelect) || !finalSingleItem || finalSingleItem.t !== 'local' || !finalSingleItem.completedQuery) {
       return;
     }
-    if (await singleItem.query.hasCsv()) {
-      void this.tryOpenExternalFile(singleItem.query.csvPath);
+    const query = finalSingleItem.completedQuery.query;
+    if (await query.hasCsv()) {
+      void this.tryOpenExternalFile(query.csvPath);
       return;
     }
-    await singleItem.query.exportCsvResults(this.qs, singleItem.query.csvPath, () => {
+    await query.exportCsvResults(this.qs, query.csvPath, () => {
       void this.tryOpenExternalFile(
-        singleItem.query.csvPath
+        query.csvPath
       );
     });
   }
 
   async handleViewCsvAlerts(
-    singleItem: CompletedQuery,
-    multiSelect: CompletedQuery[]
+    singleItem: QueryHistoryInfo,
+    multiSelect: QueryHistoryInfo[]
   ) {
-    if (!this.assertSingleQuery(multiSelect)) {
+    const { finalSingleItem, finalMultiSelect } = this.determineSelection(singleItem, multiSelect);
+
+    // Local queries only
+    if (!this.assertSingleQuery(finalMultiSelect) || !finalSingleItem || finalSingleItem.t !== 'local' || !finalSingleItem.completedQuery) {
       return;
     }
 
     await this.tryOpenExternalFile(
-      await singleItem.query.ensureCsvProduced(this.qs)
+      await finalSingleItem.completedQuery.query.ensureCsvAlerts(this.qs, this.dbm)
     );
   }
 
   async handleViewDil(
-    singleItem: CompletedQuery,
-    multiSelect: CompletedQuery[],
+    singleItem: QueryHistoryInfo,
+    multiSelect: QueryHistoryInfo[],
   ) {
-    if (!this.assertSingleQuery(multiSelect)) {
+    const { finalSingleItem, finalMultiSelect } = this.determineSelection(singleItem, multiSelect);
+
+    // Local queries only
+    if (!this.assertSingleQuery(finalMultiSelect) || !finalSingleItem || finalSingleItem.t !== 'local' || !finalSingleItem.completedQuery) {
       return;
     }
 
     await this.tryOpenExternalFile(
-      await singleItem.query.ensureDilPath(this.qs)
+      await finalSingleItem.completedQuery.query.ensureDilPath(this.qs)
     );
   }
 
-  async getQueryText(queryHistoryItem: CompletedQuery): Promise<string> {
-    if (queryHistoryItem.options.queryText) {
-      return queryHistoryItem.options.queryText;
-    } else if (queryHistoryItem.query.quickEvalPosition) {
-      // capture all selected lines
-      const startLine = queryHistoryItem.query.quickEvalPosition.line;
-      const endLine = queryHistoryItem.query.quickEvalPosition.endLine;
-      const textDocument = await vscode.workspace.openTextDocument(
-        queryHistoryItem.query.quickEvalPosition.fileName
-      );
-      return textDocument.getText(
-        new vscode.Range(startLine - 1, 0, endLine, 0)
-      );
-    } else {
-      return '';
+  async handleOpenOnGithub(
+    singleItem: QueryHistoryInfo,
+    multiSelect: QueryHistoryInfo[],
+  ) {
+    const { finalSingleItem, finalMultiSelect } = this.determineSelection(singleItem, multiSelect);
+
+    // Remote queries only
+    if (!this.assertSingleQuery(finalMultiSelect) || !finalSingleItem || finalSingleItem.t !== 'remote') {
+      return;
     }
+
+    const { actionsWorkflowRunId: workflowRunId, controllerRepository: { owner, name } } = finalSingleItem.remoteQuery;
+
+    await commands.executeCommand(
+      'vscode.open',
+      Uri.parse(`https://github.com/${owner}/${name}/actions/runs/${workflowRunId}`)
+    );
   }
 
-  buildCompletedQuery(info: QueryWithResults): CompletedQuery {
-    const item = new CompletedQuery(info, this.queryHistoryConfigListener);
-    return item;
+  async getQueryText(item: QueryHistoryInfo): Promise<string> {
+    return item.t === 'local'
+      ? item.initialInfo.queryText
+      : item.remoteQuery.queryText;
   }
 
-  addCompletedQuery(item: CompletedQuery) {
+  addQuery(item: QueryHistoryInfo) {
     this.treeDataProvider.pushQuery(item);
     this.updateTreeViewSelectionIfVisible();
-  }
-
-  find(queryId: number): CompletedQuery | undefined {
-    return this.treeDataProvider.find(queryId);
+    this._onDidAddQueryItem.fire(item);
   }
 
   /**
@@ -668,15 +910,15 @@ export class QueryHistoryManager extends DisposableObject {
         // We must fire the onDidChangeTreeData event to ensure the current element can be selected
         // using `reveal` if the tree view was not visible when the current element was added.
         this.treeDataProvider.refresh();
-        void this.treeView.reveal(current);
+        void this.treeView.reveal(current, { select: true });
       }
     }
   }
 
   private async tryOpenExternalFile(fileLocation: string) {
-    const uri = vscode.Uri.file(fileLocation);
+    const uri = Uri.file(fileLocation);
     try {
-      await vscode.window.showTextDocument(uri, { preview: false });
+      await window.showTextDocument(uri, { preview: false });
     } catch (e) {
       if (
         e.message.includes(
@@ -693,7 +935,7 @@ the file in the file explorer and dragging it into the workspace.`
         );
         if (res) {
           try {
-            await vscode.commands.executeCommand('revealFileInOS', uri);
+            await commands.executeCommand('revealFileInOS', uri);
           } catch (e) {
             void showAndLogErrorMessage(e.message);
           }
@@ -707,26 +949,34 @@ the file in the file explorer and dragging it into the workspace.`
   }
 
   private async findOtherQueryToCompare(
-    singleItem: CompletedQuery,
-    multiSelect: CompletedQuery[]
-  ): Promise<CompletedQuery | undefined> {
-    const dbName = singleItem.database.name;
+    singleItem: QueryHistoryInfo,
+    multiSelect: QueryHistoryInfo[]
+  ): Promise<CompletedLocalQueryInfo | undefined> {
+
+    // Remote queries cannot be compared
+    if (singleItem.t !== 'local' || multiSelect.some(s => s.t !== 'local') || !singleItem.completedQuery) {
+      return undefined;
+    }
+    const dbName = singleItem.initialInfo.databaseInfo.name;
 
     // if exactly 2 queries are selected, use those
     if (multiSelect?.length === 2) {
       // return the query that is not the first selected one
       const otherQuery =
-        singleItem === multiSelect[0] ? multiSelect[1] : multiSelect[0];
-      if (!otherQuery.didRunSuccessfully) {
+        (singleItem === multiSelect[0] ? multiSelect[1] : multiSelect[0]) as LocalQueryInfo;
+      if (!otherQuery.completedQuery) {
+        throw new Error('Please select a completed query.');
+      }
+      if (!otherQuery.completedQuery.didRunSuccessfully) {
         throw new Error('Please select a successful query.');
       }
-      if (otherQuery.database.name !== dbName) {
+      if (otherQuery.initialInfo.databaseInfo.name !== dbName) {
         throw new Error('Query databases must be the same.');
       }
-      return otherQuery;
+      return otherQuery as CompletedLocalQueryInfo;
     }
 
-    if (multiSelect?.length > 1) {
+    if (multiSelect?.length > 2) {
       throw new Error('Please select no more than 2 queries.');
     }
 
@@ -735,23 +985,25 @@ the file in the file explorer and dragging it into the workspace.`
       .filter(
         (otherQuery) =>
           otherQuery !== singleItem &&
-          otherQuery.didRunSuccessfully &&
-          otherQuery.database.name === dbName
+          otherQuery.t === 'local' &&
+          otherQuery.completedQuery &&
+          otherQuery.completedQuery.didRunSuccessfully &&
+          otherQuery.initialInfo.databaseInfo.name === dbName
       )
-      .map((otherQuery) => ({
-        label: otherQuery.toString(),
-        description: otherQuery.databaseName,
-        detail: otherQuery.statusString,
-        query: otherQuery,
+      .map((item) => ({
+        label: item.label,
+        description: (item as CompletedLocalQueryInfo).initialInfo.databaseInfo.name,
+        detail: (item as CompletedLocalQueryInfo).completedQuery.statusString,
+        query: item as CompletedLocalQueryInfo,
       }));
     if (comparableQueryLabels.length < 1) {
       throw new Error('No other queries available to compare with.');
     }
-    const choice = await vscode.window.showQuickPick(comparableQueryLabels);
+    const choice = await window.showQuickPick(comparableQueryLabels);
     return choice?.query;
   }
 
-  private assertSingleQuery(multiSelect: CompletedQuery[] = [], message = 'Please select a single query.') {
+  private assertSingleQuery(multiSelect: QueryHistoryInfo[] = [], message = 'Please select a single query.') {
     if (multiSelect.length > 1) {
       void showAndLogErrorMessage(
         message
@@ -778,7 +1030,7 @@ the file in the file explorer and dragging it into the workspace.`
    *
    * @param newSelection the new selection after the most recent selection change
    */
-  private updateCompareWith(newSelection: CompletedQuery[]) {
+  private updateCompareWith(newSelection: LocalQueryInfo[]) {
     if (newSelection.length === 1) {
       this.compareWithItem = newSelection[0];
     } else if (
@@ -792,6 +1044,9 @@ the file in the file explorer and dragging it into the workspace.`
 
   /**
    * If no items are selected, attempt to grab the selection from the treeview.
+   * However, often the treeview itself does not have any selection. In this case,
+   * grab the selection from the `treeDataProvider` current item.
+   *
    * We need to use this method because when clicking on commands from the view title
    * bar, the selections are not passed in.
    *
@@ -799,17 +1054,33 @@ the file in the file explorer and dragging it into the workspace.`
    * @param multiSelect a multi-select or undefined if no items are selected
    */
   private determineSelection(
-    singleItem: CompletedQuery,
-    multiSelect: CompletedQuery[]
-  ): { finalSingleItem: CompletedQuery; finalMultiSelect: CompletedQuery[] } {
-    if (singleItem === undefined && (multiSelect === undefined || multiSelect.length === 0 || multiSelect[0] === undefined)) {
+    singleItem: QueryHistoryInfo,
+    multiSelect: QueryHistoryInfo[]
+  ): {
+    finalSingleItem: QueryHistoryInfo;
+    finalMultiSelect: QueryHistoryInfo[]
+  } {
+    if (!singleItem && !multiSelect?.[0]) {
       const selection = this.treeView.selection;
-      if (selection) {
+      const current = this.treeDataProvider.getCurrent();
+      if (selection?.length) {
         return {
           finalSingleItem: selection[0],
-          finalMultiSelect: selection
+          finalMultiSelect: [...selection]
+        };
+      } else if (current) {
+        return {
+          finalSingleItem: current,
+          finalMultiSelect: [current]
         };
       }
+    }
+
+    // ensure we only return undefined if we have neither a single or multi-selecion
+    if (singleItem && !multiSelect?.[0]) {
+      multiSelect = [singleItem];
+    } else if (!singleItem && multiSelect?.[0]) {
+      singleItem = multiSelect[0];
     }
     return {
       finalSingleItem: singleItem,
@@ -817,7 +1088,8 @@ the file in the file explorer and dragging it into the workspace.`
     };
   }
 
-  async refreshTreeView(completedQuery: CompletedQuery): Promise<void> {
-    this.treeDataProvider.refresh(completedQuery);
+  async refreshTreeView(): Promise<void> {
+    this.treeDataProvider.refresh();
+    await this.writeQueryHistory();
   }
 }

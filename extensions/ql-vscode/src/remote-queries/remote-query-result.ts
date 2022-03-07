@@ -1,12 +1,16 @@
+import { DownloadLink } from './download-link';
+import { AnalysisFailure } from './shared/analysis-failure';
+
 export interface RemoteQueryResult {
-  executionEndTime: Date;
-  analysisResults: AnalysisResult[];
-  allResultsDownloadUri: string;
+  executionEndTime: number; // Can't use a Date here since it needs to be serialized and desserialized.
+  analysisSummaries: AnalysisSummary[];
+  analysisFailures: AnalysisFailure[];
+  queryId: string;
 }
 
-export interface AnalysisResult {
+export interface AnalysisSummary {
   nwo: string,
   resultCount: number,
-  downloadUri: string,
+  downloadLink: DownloadLink,
   fileSizeInBytes: number
 }

@@ -1,5 +1,3 @@
-import * as vscode from 'vscode';
-
 import { decodeSourceArchiveUri, encodeArchiveBasePath } from '../archive-filesystem-provider';
 import { ColumnKindCode, EntityValue, getResultSetSchema, ResultSetSchema } from '../pure/bqrs-cli-types';
 import { CodeQLCliServer } from '../cli';
@@ -7,16 +5,17 @@ import { DatabaseManager, DatabaseItem } from '../databases';
 import fileRangeFromURI from './fileRangeFromURI';
 import * as messages from '../pure/messages';
 import { QueryServerClient } from '../queryserver-client';
-import { QueryWithResults, compileAndRunQueryAgainstDatabase } from '../run-queries';
+import { QueryWithResults, compileAndRunQueryAgainstDatabase, createInitialQueryInfo } from '../run-queries';
 import { ProgressCallback } from '../commandRunner';
 import { KeyType } from './keyType';
 import { qlpackOfDatabase, resolveQueries } from './queryResolver';
+import { CancellationToken, LocationLink, Uri } from 'vscode';
 
 export const SELECT_QUERY_NAME = '#select';
 export const TEMPLATE_NAME = 'selectedSourceFile';
 
-export interface FullLocationLink extends vscode.LocationLink {
-  originUri: vscode.Uri;
+export interface FullLocationLink extends LocationLink {
+  originUri: Uri;
 }
 
 /**
@@ -29,6 +28,7 @@ export interface FullLocationLink extends vscode.LocationLink {
  * @param dbm The database manager
  * @param uriString The selected source file and location
  * @param keyType The contextual query type to run
+ * @param queryStorageDir The directory to store the query results
  * @param progress A progress callback
  * @param token A CancellationToken
  * @param filter A function that will filter extraneous results
@@ -39,11 +39,12 @@ export async function getLocationsForUriString(
   dbm: DatabaseManager,
   uriString: string,
   keyType: KeyType,
+  queryStorageDir: string,
   progress: ProgressCallback,
-  token: vscode.CancellationToken,
+  token: CancellationToken,
   filter: (src: string, dest: string) => boolean
 ): Promise<FullLocationLink[]> {
-  const uri = decodeSourceArchiveUri(vscode.Uri.parse(uriString, true));
+  const uri = decodeSourceArchiveUri(Uri.parse(uriString, true));
   const sourceArchiveUri = encodeArchiveBasePath(uri.sourceArchiveZipPath);
 
   const db = dbm.findDatabaseItemBySourceArchive(sourceArchiveUri);
@@ -56,12 +57,21 @@ export async function getLocationsForUriString(
 
   const links: FullLocationLink[] = [];
   for (const query of await resolveQueries(cli, qlpack, keyType)) {
+    const initialInfo = await createInitialQueryInfo(
+      Uri.file(query),
+      {
+        name: db.name,
+        databaseUri: db.databaseUri.toString(),
+      },
+      false
+    );
+
     const results = await compileAndRunQueryAgainstDatabase(
       cli,
       qs,
       db,
-      false,
-      vscode.Uri.file(query),
+      initialInfo,
+      queryStorageDir,
       progress,
       token,
       templates

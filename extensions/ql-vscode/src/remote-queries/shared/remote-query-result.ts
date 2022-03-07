@@ -1,18 +1,25 @@
+import { DownloadLink } from '../download-link';
+import { AnalysisFailure } from './analysis-failure';
+
 export interface RemoteQueryResult {
   queryTitle: string;
-  queryFile: string;
+  queryFileName: string;
+  queryFilePath: string;
+  queryText: string;
+  language: string;
+  workflowRunUrl: string;
   totalRepositoryCount: number;
   affectedRepositoryCount: number;
   totalResultCount: number;
   executionTimestamp: string;
   executionDuration: string;
-  downloadLink: string;
-  results: AnalysisResult[]
+  analysisSummaries: AnalysisSummary[];
+  analysisFailures: AnalysisFailure[];
 }
 
-export interface AnalysisResult {
+export interface AnalysisSummary {
   nwo: string,
   resultCount: number,
-  downloadLink: string,
+  downloadLink: DownloadLink,
   fileSize: string,
 }

@@ -30,6 +30,8 @@ export class RemoteQueriesMonitor {
     let attemptCount = 0;
 
     while (attemptCount <= RemoteQueriesMonitor.maxAttemptCount) {
+      await this.sleep(RemoteQueriesMonitor.sleepTime);
+
       if (cancellationToken && cancellationToken.isCancellationRequested) {
         return { status: 'Cancelled' };
       }
@@ -44,7 +46,6 @@ export class RemoteQueriesMonitor {
         return workflowStatus;
       }
 
-      await this.sleep(RemoteQueriesMonitor.sleepTime);
       attemptCount++;
     }
 
